@@ -2927,6 +2927,7 @@ def _synthesize_unlocked(
 
     quality_reports: list[dict] = []
     quality_fallback_used = False
+    speed_optimization_used = False
     completed_batches: list[Path] = []
     batch_directory = selected_directory / f".{basename}.parts"
 
@@ -3095,6 +3096,9 @@ def _synthesize_unlocked(
             quality_report = analyze_audio_quality(generated_audio, VOICE_SAMPLE_RATE)
             quality_reports.append(quality_report)
             quality_fallback_used = quality_fallback_used or model.last_quality_fallback_used
+            speed_optimization_used = speed_optimization_used or bool(
+                getattr(model, "last_speed_optimization_used", False)
+            )
             del generated_audio
             gc.collect()
             _release_mlx_batch_memory()
@@ -3167,6 +3171,7 @@ def _synthesize_unlocked(
         fallback_note = "｜已自动启用高质量声码器"
     else:
         fallback_note = ""
+    speed_note = "｜2.5 长文已自动使用平衡扩散步数" if speed_optimization_used else ""
     quality_note = ""
     if quality_reports:
         high_frequency_mean = sum(
@@ -3175,7 +3180,7 @@ def _synthesize_unlocked(
         quality_note = f"｜音质检查通过（高频均值 {high_frequency_mean * 100:.1f}%）"
     status = (
         f"生成完成｜{backend_label}｜{len(cleaned_text)} 字符｜耗时 {elapsed:.1f} 秒｜"
-        f"{reference_note}{fallback_note}{quality_note}｜格式 {selected_format.upper()}｜"
+        f"{reference_note}{fallback_note}{speed_note}{quality_note}｜格式 {selected_format.upper()}｜"
         f"已保存至 {final_path}"
     )
     with _generation_progress_lock:

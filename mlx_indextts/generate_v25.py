@@ -24,10 +24,15 @@ SPEAKER_CACHE_VERSION = 2.5
 # IndexTTS 2.5 can lose monotonic text/audio alignment when one autoregressive
 # segment grows beyond roughly 25 seconds.  The upstream default of 120 text
 # tokens sits on that boundary for Chinese and is too large for Latin text.
-V25_SAFE_TEXT_TOKEN_LIMIT = 60
+V25_SAFE_LATIN_TEXT_TOKEN_LIMIT = 60
+V25_SAFE_CJK_TEXT_TOKEN_LIMIT = 90
+# Backward-compatible name for callers that need the strict cross-language cap.
+V25_SAFE_TEXT_TOKEN_LIMIT = V25_SAFE_LATIN_TEXT_TOKEN_LIMIT
 V25_MIN_TEXT_TOKEN_LIMIT = 12
 V25_MAX_SEGMENT_SECONDS = 25.0
 V25_DURATION_GUARD_RETRIES = 2
+V25_LONG_FORM_SEGMENTS = 4
+V25_LONG_FORM_DIFFUSION_STEPS = 16
 
 
 class _TokenizerAdapter:
@@ -52,14 +57,24 @@ class IndexTTSv25:
         self.tokenizer = _TokenizerAdapter(self)
         self.cache: dict[str, SpeakerContext] = {}
         self.last_quality_fallback_used = False
+        self.last_speed_optimization_used = False
+
+    @staticmethod
+    def _effective_text_limit(text: str, requested: int) -> int:
+        """Use a larger safe budget for CJK and a stricter one for Latin text."""
+        cjk_or_kana = len(re.findall(r"[\u3400-\u9fff\u3040-\u30ff]", text))
+        latin_letters = len(re.findall(r"[A-Za-z]", text))
+        safe_cap = (
+            V25_SAFE_CJK_TEXT_TOKEN_LIMIT
+            if cjk_or_kana >= latin_letters
+            else V25_SAFE_LATIN_TEXT_TOKEN_LIMIT
+        )
+        return max(V25_MIN_TEXT_TOKEN_LIMIT, min(safe_cap, int(requested)))
 
     @staticmethod
     def split_text(text: str, max_tokens_per_segment: int = 120) -> list[str]:
         """Split on natural pauses and keep every 2.5 segment in its safe range."""
-        limit = max(
-            V25_MIN_TEXT_TOKEN_LIMIT,
-            min(V25_SAFE_TEXT_TOKEN_LIMIT, int(max_tokens_per_segment)),
-        )
+        limit = IndexTTSv25._effective_text_limit(text, max_tokens_per_segment)
         units = re.split(r"(?<=[。！？；，.!?;,\n])", str(text))
         pieces: list[str] = []
         current = ""
@@ -204,18 +219,27 @@ class IndexTTSv25:
     ) -> np.ndarray:
         del emotion, emo_alpha, fast_vocoder
         self.last_quality_fallback_used = False
-        safe_text_limit = max(
-            V25_MIN_TEXT_TOKEN_LIMIT,
-            min(V25_SAFE_TEXT_TOKEN_LIMIT, int(max_text_tokens_per_segment)),
-        )
+        self.last_speed_optimization_used = False
+        safe_text_limit = self._effective_text_limit(text, max_text_tokens_per_segment)
         pieces = self.split_text(text, safe_text_limit)
         if not pieces:
             raise ValueError("文本为空")
         speaker = self._speaker(reference_audio)
         generated: list[np.ndarray] = []
         partial_path = Path(output_path).with_suffix(".partial.wav") if output_path else None
+        effective_diffusion_steps = int(diffusion_steps)
+        if len(pieces) >= V25_LONG_FORM_SEGMENTS:
+            effective_diffusion_steps = min(
+                effective_diffusion_steps,
+                V25_LONG_FORM_DIFFUSION_STEPS,
+            )
+            self.last_speed_optimization_used = effective_diffusion_steps < int(
+                diffusion_steps
+            )
 
-        def synthesize_guarded(piece: str, piece_seed: Optional[int], depth: int = 0) -> np.ndarray:
+        def synthesize_guarded(
+            piece: str, piece_seed: Optional[int], depth: int = 0
+        ) -> np.ndarray:
             # Acoustic tokens are roughly 30–35 Hz.  A per-piece cap prevents a
             # failed stop-token sample from running all the way to the global
             # 1500-token ceiling before the duration guard can reject it.
@@ -237,7 +261,7 @@ class IndexTTSv25:
                 max_text_tokens_per_segment=safe_text_limit,
                 interval_silence=0,
                 duration_factor=1.0 / max(0.5, float(speed)),
-                n_timesteps=int(diffusion_steps),
+                n_timesteps=effective_diffusion_steps,
                 cfg_rate=float(cfg_rate),
             )
             audio = np.asarray(pcm, dtype=np.float32) / 32768.0
