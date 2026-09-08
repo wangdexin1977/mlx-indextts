@@ -6,6 +6,35 @@ import numpy as np
 from pathlib import Path
 
 
+def test_cfm_control_callback_runs_inside_diffusion_steps():
+    """Pause/terminate checks must not wait for the whole diffusion pass."""
+    from mlx_indextts.models.s2mel.cfm import CFM
+
+    class FakeCFM:
+        zero_prompt_speech_token = False
+
+        @staticmethod
+        def estimator(x, *_args):
+            return mx.zeros_like(x)
+
+    callbacks = []
+    output = CFM.solve_euler(
+        FakeCFM(),
+        x=mx.zeros((1, 2, 4)),
+        x_lens=mx.array([4]),
+        prompt=mx.zeros((1, 2, 1)),
+        mu=mx.zeros((1, 4, 3)),
+        style=mx.zeros((1, 2)),
+        f0=None,
+        t_span=mx.array([0.0, 0.5, 1.0]),
+        inference_cfg_rate=0.0,
+        control_callback=lambda: callbacks.append(True),
+    )
+
+    assert output.shape == (1, 2, 4)
+    assert len(callbacks) == 4
+
+
 class TestBigVGANV2:
     """Tests for BigVGAN v2 vocoder."""
 

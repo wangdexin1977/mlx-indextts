@@ -30,6 +30,14 @@ dependencies = [
     "wetext>=0.1.2",
     "psutil>=7.2.2",
     "bigvgan>=2.4.1",
+    "python-docx>=1.2.0",
+    "pymupdf>=1.28.2",
+    "ebooklib>=0.20",
+    "beautifulsoup4>=4.15.0",
+    "mobi>=0.4.1",
+    "reportlab>=5.0.0",
+    "pypdf>=6.15.0",
+    "index-tts-2-5-mlx==0.1.1",
 ]
 
 [project.optional-dependencies]
@@ -44,6 +52,10 @@ v2 = [
     "safetensors>=0.4.0",
     "omegaconf>=2.3.0",
     "librosa>=0.10.0",
+    "einops>=0.8.0",
+]
+webui = [
+    "gradio>=5.0,<7",
 ]
 dev = [
     "pytest>=7.0.0",
@@ -57,9 +69,10 @@ dev = [
 
 [project.scripts]
 mlx-indextts = "mlx_indextts.cli:main"
+mlx-indextts-webui = "mlx_indextts.webui:main"
 
 [project.urls]
-Homepage = "https://github.com/your-repo/mlx-indextts"
+Homepage = "https://github.com/solar2ain/mlx-indextts"
 Repository = "https://github.com/your-repo/mlx-indextts"
 Issues = "https://github.com/your-repo/mlx-indextts/issues"
 

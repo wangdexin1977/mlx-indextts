@@ -15,7 +15,7 @@ import sys
 import time
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -40,6 +40,8 @@ EMOTION_CN_TO_EN = {
 }
 # Number of vectors per emotion category in emo_matrix
 EMO_NUM = [3, 17, 2, 8, 4, 5, 10, 24]  # sum = 73
+MAX_GENERATION_SEGMENTS = 80
+PARTIAL_CHECKPOINT_SEGMENTS = 4
 
 
 def parse_emotion(emotion_str: str) -> Dict[str, float]:
@@ -93,6 +95,87 @@ def parse_emotion(emotion_str: str) -> Dict[str, float]:
         result["calm"] = 1.0
 
     return result
+
+
+class GenerationCancelled(RuntimeError):
+    """Raised when a caller cooperatively terminates an active generation."""
+
+
+def analyze_audio_quality(audio: np.ndarray, sample_rate: int = 22050) -> dict:
+    """Measure clipping, loudness and narrow high-frequency artifacts in speech."""
+    from scipy import signal
+
+    waveform = np.asarray(audio, dtype=np.float32).reshape(-1)
+    finite = np.isfinite(waveform)
+    if waveform.size == 0 or not finite.all():
+        return {
+            "passed": False,
+            "issues": ["音频为空或包含非法数值"],
+            "peak": 0.0,
+            "rms": 0.0,
+            "clipping_ratio": 0.0,
+            "high_frequency_mean": 0.0,
+            "high_frequency_p95": 0.0,
+        }
+
+    peak = float(np.max(np.abs(waveform)))
+    rms = float(np.sqrt(np.mean(waveform * waveform)))
+    clipping_ratio = float(np.mean(np.abs(waveform) >= 0.985))
+
+    window_samples = min(waveform.size, sample_rate * 8)
+    window_count = min(16, max(1, int(np.ceil(waveform.size / (sample_rate * 30)))))
+    starts = np.linspace(
+        0,
+        max(0, waveform.size - window_samples),
+        window_count,
+        dtype=np.int64,
+    )
+    high_frequency_ratios = []
+    for start in starts:
+        chunk = waveform[start : start + window_samples]
+        if chunk.size < 2048:
+            continue
+        frequencies, _, spectrum = signal.stft(
+            chunk,
+            fs=sample_rate,
+            nperseg=2048,
+            noverlap=1536,
+            boundary=None,
+        )
+        power = np.abs(spectrum) ** 2
+        total_power = power.sum(axis=0)
+        energetic = total_power > max(float(total_power.max()) * 1e-7, 1e-12)
+        if not energetic.any():
+            continue
+        ratios = power[frequencies >= 7000].sum(axis=0) / np.maximum(total_power, 1e-12)
+        high_frequency_ratios.extend(ratios[energetic].tolist())
+
+    if high_frequency_ratios:
+        high_frequency_mean = float(np.mean(high_frequency_ratios))
+        high_frequency_p95 = float(np.percentile(high_frequency_ratios, 95))
+    else:
+        high_frequency_mean = 0.0
+        high_frequency_p95 = 0.0
+
+    issues = []
+    if rms < 0.005:
+        issues.append("整体音量过低或接近静音")
+    if clipping_ratio > 0.02:
+        issues.append("削波比例过高")
+    if high_frequency_mean > 0.15 or (
+        high_frequency_mean > 0.10 and high_frequency_p95 > 0.75
+    ):
+        issues.append("检测到异常高频能量，可能存在啸叫或金属音")
+
+    return {
+        "passed": not issues,
+        "issues": issues,
+        "peak": peak,
+        "rms": rms,
+        "clipping_ratio": clipping_ratio,
+        "high_frequency_mean": high_frequency_mean,
+        "high_frequency_p95": high_frequency_p95,
+    }
 
 
 class IndexTTSv2:
@@ -746,6 +829,11 @@ class IndexTTSv2:
         verbose: bool = False,
         segment_overlap_ms: int = 50,
         speed: float = 1.0,
+        fast_vocoder: bool = False,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        audio_chunk_callback: Optional[Callable[[np.ndarray, int], None]] = None,
+        cancel_requested: Optional[Callable[[], bool]] = None,
+        pause_requested: Optional[Callable[[], bool]] = None,
     ) -> np.ndarray:
         """Generate speech from text.
 
@@ -802,6 +890,15 @@ class IndexTTSv2:
             text_tokens_list,
             max_tokens_per_segment=max_text_tokens_per_segment,
         )
+
+        if len(segments) > MAX_GENERATION_SEGMENTS:
+            raise ValueError(
+                f"文本被拆分为 {len(segments)} 个片段，超过单次安全上限 "
+                f"{MAX_GENERATION_SEGMENTS} 个片段。请拆分文稿后分批生成。"
+            )
+
+        if progress_callback:
+            progress_callback(0, len(segments), f"已分为 {len(segments)} 段，开始生成")
 
         if verbose:
             total_tokens = len(text_tokens_list)
@@ -861,11 +958,40 @@ class IndexTTSv2:
         style = mx.array(style_pt.cpu().numpy())
 
         # 4. Generate audio for each segment
+        self.bigvgan_mlx.set_fast_mode(fast_vocoder)
+        self.last_quality_fallback_used = False
         all_audio = []
+        partial_path = None
+        if output_path:
+            output_file = Path(output_path)
+            partial_path = output_file.with_name(f"{output_file.stem}.partial.wav")
         total_gpt_gen_time = 0
         total_s2mel_time = 0
         total_vocoder_time = 0
         total_mel_tokens = 0
+
+        def save_partial_audio() -> None:
+            if not partial_path or not all_audio:
+                return
+            import soundfile as sf
+
+            sf.write(partial_path, np.concatenate(all_audio), sample_rate)
+
+        def wait_for_generation_control() -> None:
+            """Cooperatively pause or terminate without losing completed audio."""
+            if cancel_requested and cancel_requested():
+                save_partial_audio()
+                raise GenerationCancelled("用户已终止当前任务")
+
+            partial_saved = False
+            while pause_requested and pause_requested():
+                if not partial_saved:
+                    save_partial_audio()
+                    partial_saved = True
+                if cancel_requested and cancel_requested():
+                    save_partial_audio()
+                    raise GenerationCancelled("用户已终止当前任务")
+                time.sleep(0.1)
 
         # Create silence for interval
         if interval_silence > 0 and len(segments) > 1:
@@ -875,6 +1001,7 @@ class IndexTTSv2:
             silence = None
 
         for seg_idx, segment_tokens in enumerate(segments):
+            wait_for_generation_control()
             if verbose and len(segments) > 1:
                 print(f"Processing segment {seg_idx + 1}/{len(segments)}...")
 
@@ -899,6 +1026,7 @@ class IndexTTSv2:
             cache = None
 
             for i in range(max_mel_tokens):
+                wait_for_generation_control()
                 if cache is None:
                     next_token, _, cache = self.gpt.generate_step(
                         input_emb, cache, temperature, top_k, top_p,
@@ -952,6 +1080,8 @@ class IndexTTSv2:
                 warnings.warn(f"No mel tokens generated for segment {seg_idx + 1}")
                 continue
 
+            wait_for_generation_control()
+
             # 4.2 GPT forward to get latent (MLX)
             s2mel_start = time.perf_counter()
 
@@ -991,8 +1121,11 @@ class IndexTTSv2:
                 n_timesteps=diffusion_steps,
                 temperature=1.0,
                 inference_cfg_rate=cfg_rate,
+                control_callback=wait_for_generation_control,
             )
             mx.eval(mel_out)
+
+            wait_for_generation_control()
 
             s2mel_time = time.perf_counter() - s2mel_start
             total_s2mel_time += s2mel_time
@@ -1016,11 +1149,63 @@ class IndexTTSv2:
             if peak > 1.0:
                 segment_audio = segment_audio / max(peak, 1e-6)
             segment_audio = np.clip(segment_audio, -0.99, 0.99)
+
+            # The optional fast activation path can produce high-frequency
+            # artifacts for some mels.  Detect that condition per segment and
+            # immediately re-vocode the same mel with the standard BigVGAN
+            # path, avoiding an expensive full text/GPT/S2Mel regeneration.
+            segment_quality = analyze_audio_quality(segment_audio, sample_rate)
+            high_frequency_issue = any(
+                "异常高频" in issue for issue in segment_quality["issues"]
+            )
+            if fast_vocoder and high_frequency_issue:
+                if progress_callback:
+                    progress_callback(
+                        seg_idx,
+                        len(segments),
+                        f"第 {seg_idx + 1} 段检测到高频异常，正在自动使用高质量声码器重做",
+                    )
+                self.bigvgan_mlx.set_fast_mode(False)
+                fast_vocoder = False
+                self.last_quality_fallback_used = True
+                audio_out = self.bigvgan_mlx(mel_out)
+                mx.eval(audio_out)
+                segment_audio = np.array(audio_out[0, 0])
+                peak = np.abs(segment_audio).max()
+                if peak > 1.0:
+                    segment_audio = segment_audio / max(peak, 1e-6)
+                segment_audio = np.clip(segment_audio, -0.99, 0.99)
+
             all_audio.append(segment_audio)
+
+            if audio_chunk_callback:
+                preview_audio = segment_audio
+                if speed != 1.0:
+                    preview_audio = time_stretch_wsola(
+                        preview_audio,
+                        rate=speed,
+                        sample_rate=sample_rate,
+                    )
+                audio_chunk_callback(preview_audio, sample_rate)
+
+            if progress_callback:
+                progress_callback(
+                    seg_idx + 1,
+                    len(segments),
+                    f"已完成第 {seg_idx + 1}/{len(segments)} 段",
+                )
 
             # Add silence between segments (not after the last one)
             if silence is not None and seg_idx < len(segments) - 1:
                 all_audio.append(silence)
+
+            # Checkpoint periodically instead of rewriting the entire growing
+            # batch after every segment. Cancellation still writes immediately.
+            if partial_path and (
+                (seg_idx + 1) % PARTIAL_CHECKPOINT_SEGMENTS == 0
+                or seg_idx == len(segments) - 1
+            ):
+                save_partial_audio()
 
         if len(all_audio) == 0:
             raise RuntimeError("No audio generated")
@@ -1059,7 +1244,7 @@ class IndexTTSv2:
         if output_path:
             import soundfile as sf
             sf.write(output_path, audio, sample_rate)
+            if partial_path and partial_path.exists():
+                partial_path.unlink()
 
         return audio
-
-

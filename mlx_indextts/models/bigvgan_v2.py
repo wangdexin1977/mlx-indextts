@@ -311,6 +311,14 @@ class BigVGANV2(nn.Module):
 
         self.use_tanh = config.use_tanh_at_final
 
+    def set_fast_mode(self, enabled: bool) -> None:
+        """Toggle the lower-latency activation path for long-form previews."""
+        fast_mode = bool(enabled)
+        for block in self.resblocks:
+            for activation in block.activations:
+                activation.fast_mode = fast_mode
+        self.activation_post.fast_mode = fast_mode
+
     def __call__(self, x: mx.array) -> mx.array:
         """Generate audio from mel spectrogram.
 

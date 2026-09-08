@@ -388,25 +388,31 @@ class UnifiedVoiceV2(nn.Module):
         if penalty == 1.0 or not generated_tokens:
             return logits
 
-        # Get unique tokens
-        unique_tokens = list(set(generated_tokens))
+        # Update all previously generated token logits in one MLX operation.
+        # The former implementation built a full-vocabulary one-hot array for
+        # every unique token, which made long-form decoding increasingly slow.
+        unique_tokens = sorted({
+            int(token_id)
+            for token_id in generated_tokens
+            if 0 <= int(token_id) < logits.shape[-1]
+        })
+        if not unique_tokens:
+            return logits
 
-        # Create penalty mask
-        for token_id in unique_tokens:
-            if 0 <= token_id < logits.shape[-1]:
-                token_logit = logits[:, token_id]
-                # Apply penalty: positive logits get divided, negative get multiplied
-                new_logit = mx.where(
-                    token_logit > 0,
-                    token_logit / penalty,
-                    token_logit * penalty
-                )
-                # Update the logits array
-                one_hot = mx.zeros((1, logits.shape[-1]))
-                one_hot = one_hot.at[:, token_id].add(1.0)
-                logits = logits * (1 - one_hot) + new_logit * one_hot
-
-        return logits
+        token_indices = mx.array(unique_tokens, dtype=mx.int32)[None, :]
+        if logits.shape[0] > 1:
+            token_indices = mx.broadcast_to(
+                token_indices, (logits.shape[0], len(unique_tokens))
+            )
+        token_logits = mx.take_along_axis(logits, token_indices, axis=-1)
+        penalized_logits = mx.where(
+            token_logits > 0,
+            token_logits / penalty,
+            token_logits * penalty,
+        )
+        return mx.put_along_axis(
+            logits, token_indices, penalized_logits, axis=-1
+        )
 
     def _sample(
         self,
@@ -440,44 +446,49 @@ class UnifiedVoiceV2(nn.Module):
         # Apply temperature
         logits = logits / temperature
 
-        # Top-k filtering
-        if top_k > 0:
-            top_k = min(top_k, logits.shape[-1])
-            top_k_values = mx.topk(logits, top_k)
-            threshold = top_k_values[:, :1]
-            indices_to_remove = logits < threshold
-            logits = mx.where(indices_to_remove, float("-inf"), logits)
+        # Work only on the Top-K candidate set. This keeps Top-P sorting small
+        # (30 values by default instead of the full 8194-token vocabulary) and
+        # avoids the former GPU -> NumPy -> Python -> GPU round trip.
+        vocab_size = logits.shape[-1]
+        if 0 < top_k < vocab_size:
+            top_k = int(top_k)
+            partition_at = vocab_size - top_k
+            candidate_indices = mx.argpartition(
+                logits, kth=partition_at, axis=-1
+            )[:, -top_k:]
+            candidate_logits = mx.take_along_axis(
+                logits, candidate_indices, axis=-1
+            )
+        else:
+            candidate_indices = mx.broadcast_to(
+                mx.arange(vocab_size, dtype=mx.int32)[None, :], logits.shape
+            )
+            candidate_logits = logits
 
-        # Top-p (nucleus) filtering
+        # Apply nucleus filtering entirely in MLX.
         if top_p < 1.0:
-            sorted_indices = mx.argsort(logits, axis=-1)[:, ::-1]
-            sorted_logits = mx.take_along_axis(logits, sorted_indices, axis=-1)
-            cumulative_probs = mx.cumsum(mx.softmax(sorted_logits, axis=-1), axis=-1)
+            sorted_positions = mx.argsort(candidate_logits, axis=-1)[:, ::-1]
+            candidate_logits = mx.take_along_axis(
+                candidate_logits, sorted_positions, axis=-1
+            )
+            candidate_indices = mx.take_along_axis(
+                candidate_indices, sorted_positions, axis=-1
+            )
+            cumulative_probs = mx.cumsum(
+                mx.softmax(candidate_logits, axis=-1), axis=-1
+            )
+            remove = cumulative_probs > top_p
+            keep_first = mx.zeros((remove.shape[0], 1), dtype=mx.bool_)
+            remove = mx.concatenate([keep_first, remove[:, :-1]], axis=-1)
+            candidate_logits = mx.where(
+                remove, float("-inf"), candidate_logits
+            )
 
-            sorted_indices_to_remove = cumulative_probs > top_p
-            first_col = mx.zeros((sorted_indices_to_remove.shape[0], 1), dtype=mx.bool_)
-            sorted_indices_to_remove = mx.concatenate([
-                first_col,
-                sorted_indices_to_remove[:, :-1]
-            ], axis=-1)
-
-            import numpy as np
-            batch_size, vocab_size = logits.shape
-            indices_to_remove_np = np.zeros((batch_size, vocab_size), dtype=bool)
-            sorted_indices_np = np.array(sorted_indices)
-            sorted_remove_np = np.array(sorted_indices_to_remove)
-
-            for b in range(batch_size):
-                for i in range(vocab_size):
-                    if sorted_remove_np[b, i]:
-                        indices_to_remove_np[b, sorted_indices_np[b, i]] = True
-
-            indices_to_remove = mx.array(indices_to_remove_np)
-            logits = mx.where(indices_to_remove, float("-inf"), logits)
-
-        # Sample
-        probs = mx.softmax(logits, axis=-1)
-        return mx.random.categorical(mx.log(probs + 1e-10))
+        sampled_position = mx.random.categorical(candidate_logits)
+        sampled_token = mx.take_along_axis(
+            candidate_indices, sampled_position[:, None], axis=-1
+        )
+        return sampled_token[:, 0]
 
     def forward_latent(
         self,

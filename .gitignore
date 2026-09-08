@@ -38,12 +38,23 @@ Thumbs.db
 # Project specific
 /models/
 ref_audios/
+.hf-cache/
+.uv-cache/
+outputs/
+examples_voice_01.wav
+/modelscope_cache/
 *.safetensors
 *.pth
 *.pt
 *.npz
 /output*.wav
 /tmp/
+
+# Local launcher build artifacts (keep Swift/Python sources and SVG)
+/launcher-assets/IndexTTS2Launcher
+/launcher-assets/rendered/
+/launcher-assets/*.iconset/
+/launcher-assets/*.app/
 
 # Benchmark outputs
 test_outputs/

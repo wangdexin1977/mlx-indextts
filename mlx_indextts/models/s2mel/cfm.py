@@ -3,7 +3,7 @@
 This implements the flow matching diffusion model used for mel generation.
 """
 
-from typing import Optional
+from typing import Callable, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -82,6 +82,7 @@ class CFM(nn.Module):
         n_timesteps: int,
         temperature: float = 1.0,
         inference_cfg_rate: float = 0.5,
+        control_callback: Optional[Callable[[], None]] = None,
     ) -> mx.array:
         """Forward diffusion inference.
 
@@ -107,7 +108,17 @@ class CFM(nn.Module):
         t_span = mx.linspace(0, 1, n_timesteps + 1)
 
         # Solve ODE with Euler method
-        return self.solve_euler(z, x_lens, prompt, mu, style, f0, t_span, inference_cfg_rate)
+        return self.solve_euler(
+            z,
+            x_lens,
+            prompt,
+            mu,
+            style,
+            f0,
+            t_span,
+            inference_cfg_rate,
+            control_callback,
+        )
 
     def solve_euler(
         self,
@@ -119,6 +130,7 @@ class CFM(nn.Module):
         f0: Optional[mx.array],
         t_span: mx.array,
         inference_cfg_rate: float = 0.5,
+        control_callback: Optional[Callable[[], None]] = None,
     ) -> mx.array:
         """Fixed Euler solver for ODE.
 
@@ -163,6 +175,8 @@ class CFM(nn.Module):
         sol = []
 
         for step in range(1, len(t_span)):
+            if control_callback is not None:
+                control_callback()
             dt = t_span[step] - t_span[step - 1]
 
             if inference_cfg_rate > 0:
@@ -213,6 +227,9 @@ class CFM(nn.Module):
 
             # Evaluate for MLX lazy execution
             mx.eval(x)
+
+            if control_callback is not None:
+                control_callback()
 
         return sol[-1]
 

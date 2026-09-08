@@ -147,10 +147,15 @@ class UpSample1d(nn.Module):
         """
         batch, channels, length = x.shape
 
-        # Replicate padding using numpy (MLX doesn't support edge padding)
-        x_np = np.array(x)
-        x_padded = np.pad(x_np, ((0, 0), (0, 0), (self.pad, self.pad)), mode='edge')
-        x_padded = mx.array(x_padded)
+        # Replicate edge values directly in MLX.  Converting to NumPy here
+        # forces a GPU -> CPU -> GPU synchronization for every activation in
+        # BigVGAN, which dominates long-form synthesis time.
+        if self.pad > 0:
+            left = mx.broadcast_to(x[:, :, :1], (batch, channels, self.pad))
+            right = mx.broadcast_to(x[:, :, -1:], (batch, channels, self.pad))
+            x_padded = mx.concatenate((left, x, right), axis=2)
+        else:
+            x_padded = x
 
         # NCL -> NLC for conv_transpose1d
         x_nlc = x_padded.transpose(0, 2, 1)  # (batch, padded_length, channels)
@@ -214,10 +219,19 @@ class DownSample1d(nn.Module):
         """
         batch, channels, length = x.shape
 
-        # Replicate padding using numpy (MLX doesn't support edge padding)
-        x_np = np.array(x)
-        x_padded = np.pad(x_np, ((0, 0), (0, 0), (self.pad_left, self.pad_right)), mode='edge')
-        x_padded = mx.array(x_padded)
+        # Keep padding on the MLX device to avoid repeated synchronization and
+        # host transfers inside the vocoder.
+        padded_parts = []
+        if self.pad_left > 0:
+            padded_parts.append(
+                mx.broadcast_to(x[:, :, :1], (batch, channels, self.pad_left))
+            )
+        padded_parts.append(x)
+        if self.pad_right > 0:
+            padded_parts.append(
+                mx.broadcast_to(x[:, :, -1:], (batch, channels, self.pad_right))
+            )
+        x_padded = mx.concatenate(padded_parts, axis=2)
 
         # NCL -> NLC for conv1d
         x_nlc = x_padded.transpose(0, 2, 1)  # (batch, padded_length, channels)
@@ -255,6 +269,7 @@ class Activation1d(nn.Module):
         super().__init__()
         self.up_ratio = up_ratio
         self.down_ratio = down_ratio
+        self.fast_mode = False
         self.act = activation
         self.upsample = UpSample1d(up_ratio, up_kernel_size)
         self.downsample = DownSample1d(down_ratio, down_kernel_size)
@@ -268,6 +283,12 @@ class Activation1d(nn.Module):
         Returns:
             Activated (batch, channels, length)
         """
+        # Long-form preview mode can skip the expensive anti-alias filters.
+        # The learned periodic activation is retained, while synthesis becomes
+        # substantially faster at a small high-frequency quality trade-off.
+        if self.fast_mode:
+            return self.act(x)
+
         x = self.upsample(x)
         x = self.act(x)
         x = self.downsample(x)
