@@ -3161,7 +3161,12 @@ def _synthesize_unlocked(
     with _generation_progress_lock:
         elapsed = _active_elapsed(_generation_progress_state)
     reference_note = f"自定义音色：{library_entry.get('name') or Path(reference_audio).name}"
-    fallback_note = "｜已自动启用高质量声码器" if quality_fallback_used else ""
+    if quality_fallback_used and use_v25_backend:
+        fallback_note = "｜已自动拆分并重生成异常拉长片段"
+    elif quality_fallback_used:
+        fallback_note = "｜已自动启用高质量声码器"
+    else:
+        fallback_note = ""
     quality_note = ""
     if quality_reports:
         high_frequency_mean = sum(

@@ -21,6 +21,13 @@ from mlx_indextts.generate_v2 import GenerationCancelled
 
 SAMPLE_RATE = 22_050
 SPEAKER_CACHE_VERSION = 2.5
+# IndexTTS 2.5 can lose monotonic text/audio alignment when one autoregressive
+# segment grows beyond roughly 25 seconds.  The upstream default of 120 text
+# tokens sits on that boundary for Chinese and is too large for Latin text.
+V25_SAFE_TEXT_TOKEN_LIMIT = 60
+V25_MIN_TEXT_TOKEN_LIMIT = 12
+V25_MAX_SEGMENT_SECONDS = 25.0
+V25_DURATION_GUARD_RETRIES = 2
 
 
 class _TokenizerAdapter:
@@ -48,8 +55,11 @@ class IndexTTSv25:
 
     @staticmethod
     def split_text(text: str, max_tokens_per_segment: int = 120) -> list[str]:
-        """Split on natural pauses, with a conservative hard limit."""
-        limit = max(24, int(max_tokens_per_segment))
+        """Split on natural pauses and keep every 2.5 segment in its safe range."""
+        limit = max(
+            V25_MIN_TEXT_TOKEN_LIMIT,
+            min(V25_SAFE_TEXT_TOKEN_LIMIT, int(max_tokens_per_segment)),
+        )
         units = re.split(r"(?<=[。！？；，.!?;,\n])", str(text))
         pieces: list[str] = []
         current = ""
@@ -70,6 +80,31 @@ class IndexTTSv25:
         if current.strip():
             pieces.append(current.strip())
         return [piece for piece in pieces if piece]
+
+    @staticmethod
+    def _reasonable_segment_seconds(text: str, speed: float = 1.0) -> float:
+        """Return a conservative duration ceiling for one generated segment.
+
+        This is deliberately a guard, not duration control.  It only catches
+        the characteristic 2.5 alignment collapse where a short sentence is
+        expanded into a very long, distorted utterance.
+        """
+        cjk_or_kana = len(re.findall(r"[\u3400-\u9fff\u3040-\u30ff]", text))
+        latin_words = len(re.findall(r"[A-Za-z]+(?:['’-][A-Za-z]+)*", text))
+        digits = len(re.findall(r"\d", text))
+        speech_units = max(1, cjk_or_kana + latin_words + digits)
+        natural_ceiling = max(6.0, speech_units * 0.55 + 4.0)
+        base_ceiling = min(V25_MAX_SEGMENT_SECONDS, natural_ceiling)
+        return base_ceiling / max(0.5, float(speed))
+
+    @staticmethod
+    def _split_failed_piece(text: str, limit: int) -> list[str]:
+        """Split a failed piece more aggressively, even without punctuation."""
+        pieces = IndexTTSv25.split_text(text, limit)
+        if len(pieces) > 1 or len(text) < 2:
+            return pieces
+        midpoint = len(text) // 2
+        return [part.strip() for part in (text[:midpoint], text[midpoint:]) if part.strip()]
 
     @staticmethod
     def _save_context(context: SpeakerContext, output_path: str) -> None:
@@ -168,12 +203,83 @@ class IndexTTSv25:
         pause_requested: Optional[Callable[[], bool]] = None,
     ) -> np.ndarray:
         del emotion, emo_alpha, fast_vocoder
-        pieces = self.split_text(text, max_text_tokens_per_segment)
+        self.last_quality_fallback_used = False
+        safe_text_limit = max(
+            V25_MIN_TEXT_TOKEN_LIMIT,
+            min(V25_SAFE_TEXT_TOKEN_LIMIT, int(max_text_tokens_per_segment)),
+        )
+        pieces = self.split_text(text, safe_text_limit)
         if not pieces:
             raise ValueError("文本为空")
         speaker = self._speaker(reference_audio)
         generated: list[np.ndarray] = []
         partial_path = Path(output_path).with_suffix(".partial.wav") if output_path else None
+
+        def synthesize_guarded(piece: str, piece_seed: Optional[int], depth: int = 0) -> np.ndarray:
+            # Acoustic tokens are roughly 30–35 Hz.  A per-piece cap prevents a
+            # failed stop-token sample from running all the way to the global
+            # 1500-token ceiling before the duration guard can reject it.
+            base_seconds = self._reasonable_segment_seconds(piece, speed=1.0)
+            guarded_mel_limit = min(
+                int(max_mel_tokens),
+                max(240, int(base_seconds * 36.0)),
+            )
+            pcm = self.runtime.synthesize(
+                piece,
+                lang="zh",
+                spk=speaker,
+                seed=piece_seed,
+                top_k=int(top_k),
+                top_p=float(top_p),
+                temperature=float(temperature),
+                repetition_penalty=float(repetition_penalty),
+                max_mel_tokens=guarded_mel_limit,
+                max_text_tokens_per_segment=safe_text_limit,
+                interval_silence=0,
+                duration_factor=1.0 / max(0.5, float(speed)),
+                n_timesteps=int(diffusion_steps),
+                cfg_rate=float(cfg_rate),
+            )
+            audio = np.asarray(pcm, dtype=np.float32) / 32768.0
+            if audio.size == 0:
+                raise RuntimeError("IndexTTS 2.5 未生成有效音频")
+
+            actual_seconds = audio.size / SAMPLE_RATE
+            allowed_seconds = self._reasonable_segment_seconds(piece, speed=speed)
+            if actual_seconds <= allowed_seconds:
+                return audio
+
+            self.last_quality_fallback_used = True
+            if verbose:
+                print(
+                    "IndexTTS-2.5 duration guard rejected an abnormal segment: "
+                    f"{actual_seconds:.2f}s > {allowed_seconds:.2f}s; retry depth {depth + 1}"
+                )
+            if depth >= V25_DURATION_GUARD_RETRIES:
+                raise RuntimeError(
+                    "IndexTTS 2.5 连续生成异常拉长片段；已停止保存失真音频，请缩短该句后重试"
+                )
+
+            retry_limit = max(
+                V25_MIN_TEXT_TOKEN_LIMIT,
+                safe_text_limit // (2 ** (depth + 1)),
+            )
+            retry_pieces = self._split_failed_piece(piece, retry_limit)
+            retry_audio: list[np.ndarray] = []
+            for retry_index, retry_piece in enumerate(retry_pieces):
+                retry_seed = (
+                    None
+                    if piece_seed is None
+                    else int(piece_seed) + 7_919 + retry_index
+                )
+                retry_audio.append(
+                    synthesize_guarded(retry_piece, retry_seed, depth + 1)
+                )
+            return self._join_audio(
+                retry_audio,
+                min(max(0, int(interval_silence)), 120),
+                0,
+            )
 
         for index, piece in enumerate(pieces, start=1):
             while pause_requested and pause_requested():
@@ -186,25 +292,10 @@ class IndexTTSv25:
                 raise GenerationCancelled("用户已终止当前任务")
             if progress_callback:
                 progress_callback(index - 1, len(pieces), f"正在生成片段 {index}/{len(pieces)}")
-            pcm = self.runtime.synthesize(
+            audio = synthesize_guarded(
                 piece,
-                lang="zh",
-                spk=speaker,
-                seed=None if seed is None else int(seed) + index - 1,
-                top_k=int(top_k),
-                top_p=float(top_p),
-                temperature=float(temperature),
-                repetition_penalty=float(repetition_penalty),
-                max_mel_tokens=int(max_mel_tokens),
-                max_text_tokens_per_segment=int(max_text_tokens_per_segment),
-                interval_silence=0,
-                duration_factor=1.0 / max(0.5, float(speed)),
-                n_timesteps=int(diffusion_steps),
-                cfg_rate=float(cfg_rate),
+                None if seed is None else int(seed) + index - 1,
             )
-            audio = np.asarray(pcm, dtype=np.float32) / 32768.0
-            if audio.size == 0:
-                raise RuntimeError(f"第 {index} 个片段未生成有效音频")
             generated.append(audio)
             if audio_chunk_callback:
                 audio_chunk_callback(audio, SAMPLE_RATE)
