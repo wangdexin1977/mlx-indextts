@@ -2,6 +2,21 @@
 
 IndexTTS for Apple Silicon using MLX. Zero-shot text-to-speech with voice cloning capabilities.
 
+## WebUI model switching
+
+The WebUI can switch between IndexTTS 2.5, IndexTTS 2.0 and the local MLX
+OmniVoice backend. OmniVoice supports voice cloning, text-described voice
+design and automatic voices, and is loaded only when selected.
+
+```bash
+uv add mlx-audio==0.4.4
+uv run hf download mlx-community/OmniVoice-bfloat16 \
+  --local-dir models/OmniVoice-bfloat16
+```
+
+OmniVoice model weights are licensed CC-BY-NC (non-commercial use). This is
+the k2-fsa OmniVoice project, not Xiaomi's official MiMo TTS.
+
 ## Features
 
 - Run IndexTTS 1.5/2.0 natively on Apple Silicon

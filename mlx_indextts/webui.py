@@ -30,6 +30,7 @@ from mlx_indextts.generate_v2 import (
     analyze_audio_quality,
 )
 from mlx_indextts.generate_v25 import IndexTTSv25
+from mlx_indextts.generate_omnivoice import OmniVoiceTTS
 from mlx_indextts.document_import import (
     DocumentImportError,
     ImportedDocument,
@@ -44,6 +45,7 @@ from mlx_indextts.power_monitor import start_macos_power_monitor
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODEL_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2.5-int8"
 MODEL_V2_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2"
+OMNIVOICE_MODEL_DIR = PROJECT_ROOT / "models" / "OmniVoice-bfloat16"
 DEFAULT_SPEAKER = PROJECT_ROOT / "outputs" / "voice_01_speaker.npz"
 DEFAULT_VOICE_PREVIEW = PROJECT_ROOT / "outputs" / "voice_01_preview.wav"
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "webui"
@@ -63,6 +65,7 @@ MAX_SYNTHESIS_BATCH_SEGMENTS = 32
 MLX_CACHE_CLEAR_THRESHOLD_BYTES = 2 * 1024 * 1024 * 1024
 
 DEFAULT_SETTINGS = {
+    "model_backend": "IndexTTS 2.5",
     "emotion": "跟随参考音频",
     "emotion_strength": 0.6,
     "speed": 1.0,
@@ -80,6 +83,23 @@ DEFAULT_SETTINGS = {
     "fast_vocoder": False,
 }
 
+DEFAULT_OMNIVOICE_SETTINGS = {
+    "omnivoice_mode": "clone",
+    "omnivoice_language": "chinese",
+    "omnivoice_ref_text": "",
+    "omnivoice_instruct": "",
+    "omnivoice_duration_s": 0.0,
+    "omnivoice_num_steps": 32,
+    "omnivoice_guidance_scale": 2.0,
+    "omnivoice_class_temperature": 0.0,
+    "omnivoice_position_temperature": 5.0,
+    "omnivoice_layer_penalty_factor": 5.0,
+    "omnivoice_t_shift": 0.1,
+    "omnivoice_ref_audio_max_duration_s": 10.0,
+}
+
+MODEL_BACKENDS = ("IndexTTS 2.5", "IndexTTS 2.0", "OmniVoice")
+
 EMOTIONS = {
     "自然/平静": "calm",
     "高兴": "happy",
@@ -92,7 +112,7 @@ EMOTIONS = {
     "跟随参考音频": None,
 }
 
-_model: IndexTTSv25 | IndexTTSv2 | None = None
+_model: IndexTTSv25 | IndexTTSv2 | OmniVoiceTTS | None = None
 _model_backend: str | None = None
 _model_lock = threading.Lock()
 _synthesis_job_lock = threading.Lock()
@@ -1125,9 +1145,25 @@ def get_legacy_emotion_model() -> IndexTTSv2:
     return _model
 
 
+def get_omnivoice_model() -> OmniVoiceTTS:
+    """Load the local Apple-Silicon OmniVoice backend on demand."""
+    global _model, _model_backend
+    if _model is None or _model_backend != "omnivoice":
+        with _model_lock:
+            if _model is None or _model_backend != "omnivoice":
+                _release_loaded_model_unlocked()
+                if not OMNIVOICE_MODEL_DIR.exists():
+                    raise RuntimeError(f"找不到 OmniVoice 模型目录：{OMNIVOICE_MODEL_DIR}")
+                _model = OmniVoiceTTS(str(OMNIVOICE_MODEL_DIR))
+                _model_backend = "omnivoice"
+    assert isinstance(_model, OmniVoiceTTS)
+    return _model
+
+
 def _read_config_unlocked() -> dict:
     config = {
         **DEFAULT_SETTINGS,
+        **DEFAULT_OMNIVOICE_SETTINGS,
         "reference_audio": None,
         "reference_conditioning": None,
         "reference_cache_version": None,
@@ -1143,12 +1179,6 @@ def _read_config_unlocked() -> dict:
             saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             if isinstance(saved, dict):
                 config.update(saved)
-                if saved.get("model_version") != "2.5":
-                    config["model_version"] = "2.5"
-                    config["emotion"] = "跟随参考音频"
-                    config["emotion_strength"] = DEFAULT_SETTINGS["emotion_strength"]
-                    config["reference_conditioning"] = None
-                    config["reference_cache_version"] = None
         except (OSError, json.JSONDecodeError):
             pass
 
@@ -1167,6 +1197,9 @@ def _read_config_unlocked() -> dict:
         config["optimized_duration"] = None
     if config.get("emotion") not in EMOTIONS:
         config["emotion"] = DEFAULT_SETTINGS["emotion"]
+    if config.get("model_backend") not in MODEL_BACKENDS:
+        old_version = str(config.get("model_version") or "2.5")
+        config["model_backend"] = "IndexTTS 2.0" if old_version.startswith("2.0") else "IndexTTS 2.5"
     if str(config.get("output_format", "")).lower() not in OUTPUT_FORMATS:
         config["output_format"] = "wav"
     if not str(config.get("output_directory") or "").strip():
@@ -2221,6 +2254,7 @@ def persist_uploaded_voice_with_library(
 
 
 def save_user_settings(
+    model_backend: str,
     emotion: str,
     emotion_strength: float,
     speed: float,
@@ -2241,7 +2275,8 @@ def save_user_settings(
 ) -> None:
     """Persist all adjustable synthesis settings."""
     update_user_config(
-        model_version="2.5",
+        model_backend=model_backend if model_backend in MODEL_BACKENDS else "IndexTTS 2.5",
+        model_version=("2.0" if model_backend == "IndexTTS 2.0" else "OmniVoice" if model_backend == "OmniVoice" else "2.5"),
         emotion=emotion,
         emotion_strength=float(emotion_strength),
         speed=float(speed),
@@ -2277,6 +2312,7 @@ def load_saved_state() -> tuple:
     return (
         reference,
         profile,
+        config["model_backend"],
         config["emotion"],
         config["emotion_strength"],
         config["speed"],
@@ -2297,10 +2333,54 @@ def load_saved_state() -> tuple:
     )
 
 
+def save_omnivoice_settings(
+    mode: str,
+    language: str,
+    ref_text: str,
+    instruct: str,
+    duration_s: float,
+    num_steps: float,
+    guidance_scale: float,
+    class_temperature: float,
+    position_temperature: float,
+    layer_penalty_factor: float,
+    t_shift: float,
+    ref_audio_max_duration_s: float,
+) -> None:
+    update_user_config(
+        omnivoice_mode=str(mode),
+        omnivoice_language=str(language or "None"),
+        omnivoice_ref_text=str(ref_text or ""),
+        omnivoice_instruct=str(instruct or ""),
+        omnivoice_duration_s=max(0.0, float(duration_s)),
+        omnivoice_num_steps=int(num_steps),
+        omnivoice_guidance_scale=float(guidance_scale),
+        omnivoice_class_temperature=float(class_temperature),
+        omnivoice_position_temperature=float(position_temperature),
+        omnivoice_layer_penalty_factor=float(layer_penalty_factor),
+        omnivoice_t_shift=float(t_shift),
+        omnivoice_ref_audio_max_duration_s=float(ref_audio_max_duration_s),
+    )
+
+
+def load_omnivoice_settings() -> tuple:
+    config = read_user_config()
+    return tuple(config[key] for key in DEFAULT_OMNIVOICE_SETTINGS)
+
+
+def update_model_controls(model_backend: str) -> tuple:
+    """Show only controls that affect the selected backend."""
+    if model_backend == "IndexTTS 2.0":
+        return gr.update(visible=False), gr.update(interactive=True)
+    if model_backend == "OmniVoice":
+        return gr.update(visible=True), gr.update(interactive=False)
+    return gr.update(visible=False), gr.update(value="跟随参考音频", interactive=False)
+
+
 def reset_advanced_settings() -> tuple:
     """Return the recommended IndexTTS2 generation settings."""
     defaults = DEFAULT_SETTINGS
-    update_user_config(**defaults)
+    update_user_config(**{key: value for key, value in defaults.items() if key != "model_backend"})
     return (
         defaults["emotion"],
         defaults["emotion_strength"],
@@ -2870,9 +2950,40 @@ def _resolve_emotion_backend(
     )
 
 
+def _resolve_model_backend(
+    model_backend: str,
+    emotion_label: str,
+) -> tuple[IndexTTSv25 | IndexTTSv2 | OmniVoiceTTS, str | None, str | None, str]:
+    """Resolve an explicitly selected backend; never switch models implicitly."""
+    if model_backend == "OmniVoice":
+        return get_omnivoice_model(), None, None, "OmniVoice · 本地 MLX"
+    if model_backend == "IndexTTS 2.0":
+        emotion = EMOTIONS.get(emotion_label)
+        if emotion is None:
+            emotion = "calm"
+        return get_legacy_emotion_model(), emotion, "conditioning_v2_path", f"IndexTTS 2.0 · {emotion_label}"
+    return get_model(), None, "conditioning_path", "IndexTTS 2.5 · 跟随参考音频"
+
+
+def _analyze_backend_audio(audio, sample_rate: int, model_backend: str) -> dict:
+    """Apply the spectral guard calibrated for each backend's codec/sample rate."""
+    report = analyze_audio_quality(audio, sample_rate)
+    if model_backend != "OmniVoice":
+        return report
+    high_frequency_issue = "检测到异常高频能量，可能存在啸叫或金属音"
+    # OmniVoice's 24 kHz audio tokenizer naturally retains more 7–12 kHz
+    # energy than IndexTTS's 22.05 kHz vocoder. Keep the guard for severe
+    # failures while avoiding false rejection of normal codec detail.
+    if report["high_frequency_mean"] <= 0.25 and high_frequency_issue in report["issues"]:
+        report["issues"] = [issue for issue in report["issues"] if issue != high_frequency_issue]
+        report["passed"] = not report["issues"]
+    return report
+
+
 def _synthesize_unlocked(
     text: str,
     voice_library_id: str | None,
+    model_backend: str,
     emotion_label: str,
     emotion_strength: float,
     speed: float,
@@ -2888,6 +2999,18 @@ def _synthesize_unlocked(
     repetition_penalty: float,
     cfg_rate: float,
     fast_vocoder: bool,
+    omnivoice_mode: str,
+    omnivoice_language: str,
+    omnivoice_ref_text: str,
+    omnivoice_instruct: str,
+    omnivoice_duration_s: float,
+    omnivoice_num_steps: float,
+    omnivoice_guidance_scale: float,
+    omnivoice_class_temperature: float,
+    omnivoice_position_temperature: float,
+    omnivoice_layer_penalty_factor: float,
+    omnivoice_t_shift: float,
+    omnivoice_ref_audio_max_duration_s: float,
     output_format: str,
     output_directory: str,
     progress=gr.Progress(),
@@ -2899,11 +3022,13 @@ def _synthesize_unlocked(
     # The selector value is the single source of truth. Never fall back to the
     # former global current_voice cache, which may belong to a previously used voice.
     library_entry = _load_voice_entry(voice_library_id)
-    if library_entry is None:
+    voice_required = model_backend != "OmniVoice" or omnivoice_mode == "clone"
+    if library_entry is None and voice_required:
         raise gr.Error("当前选择的音色不存在，请重新选择音色后再生成。")
-    reference_audio = str(library_entry["source_path"])
-    optimized_path = Path(str(library_entry["preview_path"]))
-    _activate_voice_entry(library_entry, track_usage=False)
+    reference_audio = str(library_entry["source_path"]) if library_entry else ""
+    optimized_path = Path(str(library_entry["preview_path"])) if library_entry else Path()
+    if library_entry:
+        _activate_voice_entry(library_entry, track_usage=False)
 
     selected_format = _normalise_output_format(output_format)
     try:
@@ -2947,50 +3072,57 @@ def _synthesize_unlocked(
 
     config = read_user_config()
     try:
-        model, emotion, conditioning_key, backend_label = _resolve_emotion_backend(
-            emotion_label
+        model, emotion, conditioning_key, backend_label = _resolve_model_backend(
+            model_backend, emotion_label
         )
-        use_v25_backend = emotion is None
-        conditioning_path = Path(str(library_entry[conditioning_key]))
-        if conditioning_path.exists():
-            reference = conditioning_path
+        use_v25_backend = model_backend == "IndexTTS 2.5"
+        if model_backend == "OmniVoice":
+            reference = optimized_path if library_entry and omnivoice_mode == "clone" else None
+            if reference is not None and not reference.exists():
+                reference = Path(reference_audio)
         else:
-            source = Path(str(library_entry["source_path"]))
-            with _generation_progress_lock:
-                _generation_progress_state.update(
-                    state="preparing",
-                    message=(
-                        f"已锁定音色“{library_entry.get('name')}”："
-                        f"正在建立 {backend_label} 专属缓存"
-                    ),
+            assert library_entry is not None and conditioning_key is not None
+            conditioning_path = Path(str(library_entry[conditioning_key]))
+            if conditioning_path.exists():
+                reference = conditioning_path
+            else:
+                source = Path(str(library_entry["source_path"]))
+                with _generation_progress_lock:
+                    _generation_progress_state.update(
+                        state="preparing",
+                        message=(
+                            f"已锁定音色“{library_entry.get('name')}”："
+                            f"正在建立 {backend_label} 专属缓存"
+                        ),
+                    )
+                conditioning, duration = _build_voice_conditioning(
+                    source,
+                    reuse_optimized=optimized_path.exists(),
+                    optimized_duration=config.get("optimized_duration"),
+                    optimized_path=optimized_path,
+                    conditioning_path=conditioning_path,
+                    model=model,
                 )
-            conditioning, duration = _build_voice_conditioning(
-                source,
-                reuse_optimized=optimized_path.exists(),
-                optimized_duration=config.get("optimized_duration"),
-                optimized_path=optimized_path,
-                conditioning_path=conditioning_path,
-                model=model,
-            )
-            _wait_for_generation_control()
-            if use_v25_backend:
-                update_user_config(
-                    reference_conditioning=conditioning,
-                    reference_cache_version=VOICE_CACHE_VERSION,
-                    optimized_duration=duration,
-                )
-                config.update(
-                    reference_conditioning=conditioning,
-                    reference_cache_version=VOICE_CACHE_VERSION,
-                    optimized_duration=duration,
-                )
-            reference = Path(conditioning)
+                _wait_for_generation_control()
+                if use_v25_backend:
+                    update_user_config(
+                        reference_conditioning=conditioning,
+                        reference_cache_version=VOICE_CACHE_VERSION,
+                        optimized_duration=duration,
+                    )
+                    config.update(
+                        reference_conditioning=conditioning,
+                        reference_cache_version=VOICE_CACHE_VERSION,
+                        optimized_duration=duration,
+                    )
+                reference = Path(conditioning)
 
-        if not reference.exists():
+        if reference is not None and not reference.exists():
             raise gr.Error("所选音色文件不存在，请重新选择或重新添加。")
         _wait_for_generation_control()
 
         save_user_settings(
+            model_backend,
             emotion_label,
             emotion_strength,
             speed,
@@ -3009,7 +3141,20 @@ def _synthesize_unlocked(
             selected_format,
             str(selected_directory),
         )
-        # Force the model to reload the selected voice's unique .npz path.
+        save_omnivoice_settings(
+            omnivoice_mode,
+            omnivoice_language,
+            omnivoice_ref_text,
+            omnivoice_instruct,
+            omnivoice_duration_s,
+            omnivoice_num_steps,
+            omnivoice_guidance_scale,
+            omnivoice_class_temperature,
+            omnivoice_position_temperature,
+            omnivoice_layer_penalty_factor,
+            omnivoice_t_shift,
+            omnivoice_ref_audio_max_duration_s,
+        )
         model.cache = {}
         requested_max_text_tokens = int(max_text_tokens)
         effective_max_text_tokens = requested_max_text_tokens
@@ -3056,7 +3201,7 @@ def _synthesize_unlocked(
                 nonlocal live_chunk_count
                 if batch_ready_callback is None:
                     return
-                quality = analyze_audio_quality(audio, int(sample_rate))
+                quality = _analyze_backend_audio(audio, int(sample_rate), model_backend)
                 if not quality["passed"]:
                     return
                 import soundfile as sf
@@ -3066,9 +3211,9 @@ def _synthesize_unlocked(
                 sf.write(str(chunk_path), audio, int(sample_rate), subtype="PCM_16")
                 batch_ready_callback(str(chunk_path))
 
-            generated_audio = model.generate(
+            generate_kwargs = dict(
                 text=batch_text,
-                reference_audio=str(reference),
+                reference_audio=str(reference) if reference is not None else None,
                 output_path=str(batch_path),
                 emotion=emotion,
                 emo_alpha=float(emotion_strength),
@@ -3093,7 +3238,24 @@ def _synthesize_unlocked(
                 ),
                 verbose=True,
             )
-            quality_report = analyze_audio_quality(generated_audio, VOICE_SAMPLE_RATE)
+            if model_backend == "OmniVoice":
+                generate_kwargs.update(
+                    omnivoice_mode=omnivoice_mode,
+                    language=omnivoice_language,
+                    ref_text=omnivoice_ref_text,
+                    instruct=omnivoice_instruct,
+                    duration_s=float(omnivoice_duration_s),
+                    num_steps=int(omnivoice_num_steps),
+                    guidance_scale=float(omnivoice_guidance_scale),
+                    class_temperature=float(omnivoice_class_temperature),
+                    position_temperature=float(omnivoice_position_temperature),
+                    layer_penalty_factor=float(omnivoice_layer_penalty_factor),
+                    t_shift=float(omnivoice_t_shift),
+                    ref_audio_max_duration_s=float(omnivoice_ref_audio_max_duration_s),
+                )
+            generated_audio = model.generate(**generate_kwargs)
+            job_sample_rate = int(getattr(model, "sample_rate", VOICE_SAMPLE_RATE))
+            quality_report = _analyze_backend_audio(generated_audio, job_sample_rate, model_backend)
             quality_reports.append(quality_report)
             quality_fallback_used = quality_fallback_used or model.last_quality_fallback_used
             speed_optimization_used = speed_optimization_used or bool(
@@ -3164,7 +3326,13 @@ def _synthesize_unlocked(
 
     with _generation_progress_lock:
         elapsed = _active_elapsed(_generation_progress_state)
-    reference_note = f"自定义音色：{library_entry.get('name') or Path(reference_audio).name}"
+    if model_backend == "OmniVoice" and omnivoice_mode == "design":
+        reference_note = "OmniVoice 音色设计"
+    elif model_backend == "OmniVoice" and omnivoice_mode == "auto":
+        reference_note = "OmniVoice 自动音色"
+    else:
+        assert library_entry is not None
+        reference_note = f"自定义音色：{library_entry.get('name') or Path(reference_audio).name}"
     if quality_fallback_used and use_v25_backend:
         fallback_note = "｜已自动拆分并重生成异常拉长片段"
     elif quality_fallback_used:
@@ -3273,6 +3441,7 @@ def _write_document_queue_manifest(
 def synthesize_document_queue_stream(
     queue_data: list[dict] | None,
     voice_library_id: str | None,
+    model_backend: str,
     emotion_label: str,
     emotion_strength: float,
     speed: float,
@@ -3288,6 +3457,18 @@ def synthesize_document_queue_stream(
     repetition_penalty: float,
     cfg_rate: float,
     fast_vocoder: bool,
+    omnivoice_mode: str,
+    omnivoice_language: str,
+    omnivoice_ref_text: str,
+    omnivoice_instruct: str,
+    omnivoice_duration_s: float,
+    omnivoice_num_steps: float,
+    omnivoice_guidance_scale: float,
+    omnivoice_class_temperature: float,
+    omnivoice_position_temperature: float,
+    omnivoice_layer_penalty_factor: float,
+    omnivoice_t_shift: float,
+    omnivoice_ref_audio_max_duration_s: float,
     output_format: str,
     output_directory: str,
 ):
@@ -3315,6 +3496,7 @@ def synthesize_document_queue_stream(
 
     synthesis_args = (
         voice_library_id,
+        model_backend,
         emotion_label,
         emotion_strength,
         speed,
@@ -3330,6 +3512,18 @@ def synthesize_document_queue_stream(
         repetition_penalty,
         cfg_rate,
         fast_vocoder,
+        omnivoice_mode,
+        omnivoice_language,
+        omnivoice_ref_text,
+        omnivoice_instruct,
+        omnivoice_duration_s,
+        omnivoice_num_steps,
+        omnivoice_guidance_scale,
+        omnivoice_class_temperature,
+        omnivoice_position_temperature,
+        omnivoice_layer_penalty_factor,
+        omnivoice_t_shift,
+        omnivoice_ref_audio_max_duration_s,
         output_format,
         output_directory,
     )
@@ -3452,6 +3646,7 @@ def synthesize_document_queue_stream(
 def synthesize_stream(
     text: str,
     voice_library_id: str | None,
+    model_backend: str,
     emotion_label: str,
     emotion_strength: float,
     speed: float,
@@ -3467,6 +3662,18 @@ def synthesize_stream(
     repetition_penalty: float,
     cfg_rate: float,
     fast_vocoder: bool,
+    omnivoice_mode: str,
+    omnivoice_language: str,
+    omnivoice_ref_text: str,
+    omnivoice_instruct: str,
+    omnivoice_duration_s: float,
+    omnivoice_num_steps: float,
+    omnivoice_guidance_scale: float,
+    omnivoice_class_temperature: float,
+    omnivoice_position_temperature: float,
+    omnivoice_layer_penalty_factor: float,
+    omnivoice_t_shift: float,
+    omnivoice_ref_audio_max_duration_s: float,
     output_format: str,
     output_directory: str,
     live_playback: bool = False,
@@ -3487,6 +3694,7 @@ def synthesize_stream(
             result["value"] = synthesize(
                 text,
                 voice_library_id,
+                model_backend,
                 emotion_label,
                 emotion_strength,
                 speed,
@@ -3502,6 +3710,18 @@ def synthesize_stream(
                 repetition_penalty,
                 cfg_rate,
                 fast_vocoder,
+                omnivoice_mode,
+                omnivoice_language,
+                omnivoice_ref_text,
+                omnivoice_instruct,
+                omnivoice_duration_s,
+                omnivoice_num_steps,
+                omnivoice_guidance_scale,
+                omnivoice_class_temperature,
+                omnivoice_position_temperature,
+                omnivoice_layer_penalty_factor,
+                omnivoice_t_shift,
+                omnivoice_ref_audio_max_duration_s,
                 output_format,
                 output_directory,
                 progress=lambda *_args, **_kwargs: None,
@@ -3580,6 +3800,7 @@ def synthesize_stream(
 
 
 def build_ui() -> gr.Blocks:
+    initial_config = read_user_config()
     with gr.Blocks(title="IndexTTS 2.5 专业语音工作台") as demo:
         document_state = gr.State(value=None)
         document_queue_state = gr.State(value=[])
@@ -3722,14 +3943,15 @@ def build_ui() -> gr.Blocks:
                 <div class="about-card-body">
                   <div class="about-current">
                     <strong>当前本机主模型：IndexTTS 2.5</strong><br>
-                    2026-08-10 官方模型架构，Apple Silicon 原生 MLX 推理。
-                    旧版 2.0 权重已保留，但不再作为默认生成后端。
+                    默认使用 IndexTTS 2.5，可切换 IndexTTS 2.0 与本地 OmniVoice MLX。
+                    三个大模型按需分时加载，避免同时占用统一内存。
                   </div>
                   <table class="about-table">
                     <thead><tr><th>组件</th><th>当前版本 / 规格</th><th>状态与作用</th></tr></thead>
                     <tbody>
                       <tr><td>IndexTTS 主模型</td><td><strong>2.5</strong></td><td><span class="version-installed">已安装、正在使用</span>；负责音色克隆、多语种语音生成和语速控制。</td></tr>
-                      <tr><td>IndexTTS 2.0</td><td><strong>2.0</strong></td><td>选择平静、高兴、悲伤等具体情绪时自动调用；与 2.5 分时加载以节省内存。</td></tr>
+                      <tr><td>IndexTTS 2.0</td><td><strong>2.0</strong></td><td>在模型选择器中切换后，可使用平静、高兴、悲伤等具体情绪。</td></tr>
+                      <tr><td>OmniVoice</td><td><strong>MLX bfloat16</strong></td><td>本地 24 kHz 多语种合成、音色克隆与文字音色设计；CC-BY-NC，非小米官方 MiMo。</td></tr>
                       <tr><td>GPT 声学 Token 模型</td><td>GPT 2.5、持久化 8-bit</td><td>自回归解码加速；音色与声码器等保真关键模块保持 FP32。</td></tr>
                       <tr><td>S2Mel</td><td>IndexTTS 2.5 CFM / DiT</td><td>将语音 Token 转换为 Mel 频谱，保持 FP32 以避免细节损失。</td></tr>
                       <tr><td>BigVGAN 声码器</td><td>2.5 内置高保真权重、22.05 kHz</td><td>将 Mel 频谱转成 WAV 波形；保持 FP32，不使用旧版快速降质路径。</td></tr>
@@ -3989,13 +4211,20 @@ def build_ui() -> gr.Blocks:
                         open=False,
                         elem_classes=["compact-parameter-accordion"],
                     ):
+                        model_backend = gr.Dropdown(
+                            label="合成模型",
+                            choices=list(MODEL_BACKENDS),
+                            value=initial_config["model_backend"],
+                            info="2.5 高保真克隆；2.0 可控情绪；OmniVoice 是本地 MLX 多语种模型。",
+                        )
                         emotion = gr.Dropdown(
                             label="表达方式 / 情绪",
                             choices=list(EMOTIONS),
-                            value="跟随参考音频",
+                            value=initial_config["emotion"],
+                            interactive=initial_config["model_backend"] == "IndexTTS 2.0",
                             info=(
-                                "跟随参考音频使用 2.5 高保真后端；"
-                                "选择具体情绪时使用 2.0 情绪控制后端。"
+                                "仅 IndexTTS 2.0 使用具体情绪；2.5 跟随参考音频，"
+                                "OmniVoice 使用下方的音色设计参数。"
                             ),
                         )
                         with gr.Row(elem_classes=["compact-parameter-grid"]):
@@ -4020,6 +4249,44 @@ def build_ui() -> gr.Blocks:
                                 precision=0,
                                 info="相同参数和种子便于复现相近结果。",
                             )
+                        with gr.Group(visible=initial_config["model_backend"] == "OmniVoice") as omnivoice_controls:
+                            gr.Markdown(
+                                "**OmniVoice 本地参数**  模型权重为 CC-BY-NC（非商业），"
+                                "并非小米官方 MiMo。克隆时强烈建议填写参考音频原文。"
+                            )
+                            omnivoice_mode = gr.Dropdown(
+                                label="OmniVoice 工作模式",
+                                choices=[("克隆已选音色", "clone"), ("根据文字设计音色", "design"), ("自动音色", "auto")],
+                                value=initial_config["omnivoice_mode"],
+                            )
+                            omnivoice_language = gr.Dropdown(
+                                label="语言",
+                                choices=["chinese", "cantonese", "english", "japanese", "korean", "french", "german", "spanish", "None"],
+                                value=initial_config["omnivoice_language"],
+                                allow_custom_value=True,
+                            )
+                            omnivoice_ref_text = gr.Textbox(
+                                label="参考音频原文（克隆模式强烈建议）",
+                                value=initial_config["omnivoice_ref_text"],
+                                lines=2,
+                            )
+                            omnivoice_instruct = gr.Textbox(
+                                label="音色设计描述（仅设计模式）",
+                                value=initial_config["omnivoice_instruct"],
+                                placeholder="例如：温暖、成熟的女声，语速自然，带轻微微笑",
+                                lines=2,
+                            )
+                            with gr.Row():
+                                omnivoice_duration_s = gr.Number(label="固定总时长（秒，0=自动）", value=initial_config["omnivoice_duration_s"], minimum=0, maximum=600, step=0.5)
+                                omnivoice_num_steps = gr.Number(label="扩散步数", value=initial_config["omnivoice_num_steps"], minimum=8, maximum=64, step=1, precision=0)
+                                omnivoice_guidance_scale = gr.Number(label="引导强度", value=initial_config["omnivoice_guidance_scale"], minimum=0, maximum=8, step=0.1)
+                            with gr.Row():
+                                omnivoice_class_temperature = gr.Number(label="类别温度", value=initial_config["omnivoice_class_temperature"], minimum=0, maximum=2, step=0.05)
+                                omnivoice_position_temperature = gr.Number(label="位置温度", value=initial_config["omnivoice_position_temperature"], minimum=0, maximum=10, step=0.1)
+                                omnivoice_layer_penalty_factor = gr.Number(label="层惩罚系数", value=initial_config["omnivoice_layer_penalty_factor"], minimum=0, maximum=10, step=0.1)
+                            with gr.Row():
+                                omnivoice_t_shift = gr.Number(label="T-Shift", value=initial_config["omnivoice_t_shift"], minimum=0, maximum=1, step=0.01)
+                                omnivoice_ref_audio_max_duration_s = gr.Number(label="参考音频最长（秒）", value=initial_config["omnivoice_ref_audio_max_duration_s"], minimum=3, maximum=30, step=0.5)
                     with gr.Row(elem_classes=["compact-generation-controls"]):
                         generate_button = gr.Button(
                             "开始生成",
@@ -4388,6 +4655,7 @@ def build_ui() -> gr.Blocks:
         )
 
         settings_inputs = [
+            model_backend,
             emotion,
             emotion_strength,
             speed,
@@ -4412,6 +4680,33 @@ def build_ui() -> gr.Blocks:
                 inputs=settings_inputs,
                 queue=False,
             )
+
+        omnivoice_inputs = [
+            omnivoice_mode,
+            omnivoice_language,
+            omnivoice_ref_text,
+            omnivoice_instruct,
+            omnivoice_duration_s,
+            omnivoice_num_steps,
+            omnivoice_guidance_scale,
+            omnivoice_class_temperature,
+            omnivoice_position_temperature,
+            omnivoice_layer_penalty_factor,
+            omnivoice_t_shift,
+            omnivoice_ref_audio_max_duration_s,
+        ]
+        for omnivoice_component in omnivoice_inputs:
+            omnivoice_component.change(
+                fn=save_omnivoice_settings,
+                inputs=omnivoice_inputs,
+                queue=False,
+            )
+        model_backend.change(
+            fn=update_model_controls,
+            inputs=[model_backend],
+            outputs=[omnivoice_controls, emotion],
+            queue=False,
+        )
 
         demo.load(
             fn=load_saved_state,
@@ -4578,6 +4873,7 @@ def build_ui() -> gr.Blocks:
             inputs=[
                 text,
                 voice_library_selector,
+                model_backend,
                 emotion,
                 emotion_strength,
                 speed,
@@ -4593,6 +4889,7 @@ def build_ui() -> gr.Blocks:
                 repetition_penalty,
                 cfg_rate,
                 fast_vocoder,
+                *omnivoice_inputs,
                 output_format,
                 output_directory,
                 live_playback,
@@ -4613,6 +4910,7 @@ def build_ui() -> gr.Blocks:
             inputs=[
                 document_queue_state,
                 voice_library_selector,
+                model_backend,
                 emotion,
                 emotion_strength,
                 speed,
@@ -4628,6 +4926,7 @@ def build_ui() -> gr.Blocks:
                 repetition_penalty,
                 cfg_rate,
                 fast_vocoder,
+                *omnivoice_inputs,
                 output_format,
                 output_directory,
             ],

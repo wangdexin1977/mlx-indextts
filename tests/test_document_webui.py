@@ -161,6 +161,7 @@ def test_confirmed_document_queue_runs_sequentially_and_writes_manifest(
         webui.synthesize_document_queue_stream(
             queue,
             "voice-id",
+            "IndexTTS 2.5",
             "自然/平静",
             0.6,
             1.0,
@@ -176,6 +177,7 @@ def test_confirmed_document_queue_runs_sequentially_and_writes_manifest(
             10.0,
             0.7,
             False,
+            "clone", "chinese", "", "", 0.0, 32, 2.0, 0.0, 5.0, 5.0, 0.1, 10.0,
             "mp3",
             str(tmp_path),
         )

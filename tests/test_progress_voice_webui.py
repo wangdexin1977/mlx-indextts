@@ -120,6 +120,7 @@ def test_progress_stream_runs_only_for_active_generation(monkeypatch):
     stream = webui.synthesize_stream(
         "测试",
         None,
+        "IndexTTS 2.5",
         "自然/平静",
         0.6,
         1.0,
@@ -135,6 +136,7 @@ def test_progress_stream_runs_only_for_active_generation(monkeypatch):
         10.0,
         0.7,
         False,
+        "clone", "chinese", "", "", 0.0, 32, 2.0, 0.0, 5.0, 5.0, 0.1, 10.0,
         "mp3",
         "/tmp",
     )
@@ -177,6 +179,7 @@ def test_live_playback_streams_each_completed_batch(tmp_path, monkeypatch):
         webui.synthesize_stream(
             "测试",
             None,
+            "IndexTTS 2.5",
             "自然/平静",
             0.6,
             1.0,
@@ -192,6 +195,7 @@ def test_live_playback_streams_each_completed_batch(tmp_path, monkeypatch):
             10.0,
             0.7,
             False,
+            "clone", "chinese", "", "", 0.0, 32, 2.0, 0.0, 5.0, 5.0, 0.1, 10.0,
             "wav",
             str(tmp_path),
             True,
@@ -670,6 +674,7 @@ def test_follow_synthesis_uses_selector_voice_and_never_legacy_conditioning(
     webui.synthesize(
         "测试文字",
         selected_entry["id"],
+        "IndexTTS 2.5",
         "跟随参考音频",
         0.6,
         1.0,
@@ -685,6 +690,7 @@ def test_follow_synthesis_uses_selector_voice_and_never_legacy_conditioning(
         8.0,
         0.65,
         False,
+        "clone", "chinese", "", "", 0.0, 32, 2.0, 0.0, 5.0, 5.0, 0.1, 10.0,
         "wav",
         str(output_dir),
         progress=lambda *_args, **_kwargs: None,
