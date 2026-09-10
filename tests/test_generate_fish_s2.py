@@ -19,6 +19,28 @@ def _adapter_with_runtime(runtime) -> FishS2ProTTS:
     return adapter
 
 
+def test_fish_initialization_uses_recommended_mlx_wired_memory(monkeypatch, tmp_path):
+    import mlx.core as mx
+    import mlx_audio.tts.utils as tts_utils
+
+    wired_limits = []
+    runtime = SimpleNamespace(sample_rate=44_100)
+    monkeypatch.setattr(mx.metal, "is_available", lambda: True)
+    monkeypatch.setattr(
+        mx,
+        "device_info",
+        lambda: {"max_recommended_working_set_size": 19_069_665_280},
+    )
+    monkeypatch.setattr(mx, "set_wired_limit", wired_limits.append)
+    monkeypatch.setattr(tts_utils, "load_model", lambda _path: runtime)
+
+    adapter = FishS2ProTTS(str(tmp_path))
+
+    assert adapter.runtime is runtime
+    assert adapter.wired_memory_limit == 19_069_665_280
+    assert wired_limits == [19_069_665_280]
+
+
 def test_fish_generation_uses_bounded_segments_and_retries_only_capped_piece(tmp_path):
     class Runtime:
         def __init__(self):

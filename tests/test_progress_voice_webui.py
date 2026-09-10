@@ -756,9 +756,10 @@ def test_about_panel_and_changelog_track_current_release():
     source = inspect.getsource(webui.build_ui)
     changelog = (webui.PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert webui.APP_VERSION == "0.3.3"
-    assert "关于 / v0.3.3" in source
+    assert webui.APP_VERSION == "0.3.4"
+    assert "关于 / v0.3.4" in source
     assert "版本变更日志" in source
+    assert "v0.3.4" in changelog
     assert "v0.3.3" in changelog
     assert "v0.3.2" in changelog
     assert "v0.3.1" in changelog

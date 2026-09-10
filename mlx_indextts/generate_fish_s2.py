@@ -39,8 +39,15 @@ class FishS2ProTTS:
     MAX_SEGMENT_CHARACTERS = 60
 
     def __init__(self, model_dir: str, asr_model_dir: str | None = None) -> None:
+        import mlx.core as mx
         from mlx_audio.tts.utils import load_model
 
+        self.wired_memory_limit = 0
+        if mx.metal.is_available():
+            recommended_limit = int(mx.device_info().get("max_recommended_working_set_size") or 0)
+            if recommended_limit > 0:
+                mx.set_wired_limit(recommended_limit)
+                self.wired_memory_limit = recommended_limit
         self.model_dir = str(model_dir)
         self.asr_model_dir = str(asr_model_dir) if asr_model_dir else None
         self.runtime = load_model(Path(model_dir))
