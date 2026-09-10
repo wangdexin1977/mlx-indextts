@@ -30,6 +30,7 @@ from mlx_indextts.generate_v2 import (
     analyze_audio_quality,
 )
 from mlx_indextts.generate_v25 import IndexTTSv25
+from mlx_indextts.generate_fish_s2 import FishS2ProTTS
 from mlx_indextts.generate_omnivoice import OmniVoiceTTS
 from mlx_indextts.document_import import (
     DocumentImportError,
@@ -43,11 +44,12 @@ from mlx_indextts.power_monitor import start_macos_power_monitor
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.3.0"
 MODEL_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2.5-int8"
 MODEL_V2_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2"
 OMNIVOICE_MODEL_DIR = PROJECT_ROOT / "models" / "OmniVoice-bfloat16"
 OMNIVOICE_ASR_MODEL_DIR = PROJECT_ROOT / "models" / "Qwen3-ASR-0.6B-8bit"
+FISH_S2_MODEL_DIR = PROJECT_ROOT / "models" / "fish-audio-s2-pro-8bit"
 DEFAULT_SPEAKER = PROJECT_ROOT / "outputs" / "voice_01_speaker.npz"
 DEFAULT_VOICE_PREVIEW = PROJECT_ROOT / "outputs" / "voice_01_preview.wav"
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "webui"
@@ -100,7 +102,19 @@ DEFAULT_OMNIVOICE_SETTINGS = {
     "omnivoice_ref_audio_max_duration_s": 10.0,
 }
 
-MODEL_BACKENDS = ("IndexTTS 2.5", "IndexTTS 2.0", "OmniVoice")
+DEFAULT_FISH_S2_SETTINGS = {
+    "fish_mode": "clone",
+    "fish_ref_text": "",
+    "fish_instruct": "",
+    "fish_temperature": 0.7,
+    "fish_top_p": 0.7,
+    "fish_top_k": 30,
+    "fish_max_tokens": 1024,
+    "fish_chunk_length": 300,
+    "fish_ref_audio_max_duration_s": 15.0,
+}
+
+MODEL_BACKENDS = ("IndexTTS 2.5", "IndexTTS 2.0", "OmniVoice", "Fish Audio S2 Pro")
 
 EMOTIONS = {
     "自然/平静": "calm",
@@ -114,7 +128,7 @@ EMOTIONS = {
     "跟随参考音频": None,
 }
 
-_model: IndexTTSv25 | IndexTTSv2 | OmniVoiceTTS | None = None
+_model: IndexTTSv25 | IndexTTSv2 | OmniVoiceTTS | FishS2ProTTS | None = None
 _model_backend: str | None = None
 _model_lock = threading.Lock()
 _synthesis_job_lock = threading.Lock()
@@ -1185,10 +1199,29 @@ def get_omnivoice_model() -> OmniVoiceTTS:
     return _model
 
 
+def get_fish_s2_model() -> FishS2ProTTS:
+    """Load Fish Audio S2 Pro 8-bit on demand and release the prior backend."""
+    global _model, _model_backend
+    if _model is None or _model_backend != "fish-s2-pro":
+        with _model_lock:
+            if _model is None or _model_backend != "fish-s2-pro":
+                _release_loaded_model_unlocked()
+                if not FISH_S2_MODEL_DIR.exists():
+                    raise RuntimeError(f"找不到 Fish Audio S2 Pro 模型目录：{FISH_S2_MODEL_DIR}")
+                _model = FishS2ProTTS(
+                    str(FISH_S2_MODEL_DIR),
+                    asr_model_dir=str(OMNIVOICE_ASR_MODEL_DIR),
+                )
+                _model_backend = "fish-s2-pro"
+    assert isinstance(_model, FishS2ProTTS)
+    return _model
+
+
 def _read_config_unlocked() -> dict:
     config = {
         **DEFAULT_SETTINGS,
         **DEFAULT_OMNIVOICE_SETTINGS,
+        **DEFAULT_FISH_S2_SETTINGS,
         "reference_audio": None,
         "reference_conditioning": None,
         "reference_cache_version": None,
@@ -2301,7 +2334,15 @@ def save_user_settings(
     """Persist all adjustable synthesis settings."""
     update_user_config(
         model_backend=model_backend if model_backend in MODEL_BACKENDS else "IndexTTS 2.5",
-        model_version=("2.0" if model_backend == "IndexTTS 2.0" else "OmniVoice" if model_backend == "OmniVoice" else "2.5"),
+        model_version=(
+            "2.0"
+            if model_backend == "IndexTTS 2.0"
+            else "OmniVoice"
+            if model_backend == "OmniVoice"
+            else "Fish Audio S2 Pro"
+            if model_backend == "Fish Audio S2 Pro"
+            else "2.5"
+        ),
         emotion=emotion,
         emotion_strength=float(emotion_strength),
         speed=float(speed),
@@ -2401,13 +2442,48 @@ def load_voice_omnivoice_transcript(voice_id: str | None) -> str:
     return str(entry.get("omnivoice_ref_text") or "") if entry else ""
 
 
+def save_fish_s2_settings(
+    mode: str,
+    ref_text: str,
+    instruct: str,
+    temperature: float,
+    top_p: float,
+    top_k: float,
+    max_tokens: float,
+    chunk_length: float,
+    ref_audio_max_duration_s: float,
+) -> None:
+    update_user_config(
+        fish_mode=str(mode or "clone"),
+        fish_instruct=str(instruct or ""),
+        fish_temperature=float(temperature),
+        fish_top_p=float(top_p),
+        fish_top_k=int(top_k),
+        fish_max_tokens=int(max_tokens),
+        fish_chunk_length=int(chunk_length),
+        fish_ref_audio_max_duration_s=float(ref_audio_max_duration_s),
+    )
+
+
+def load_voice_fish_transcript(voice_id: str | None) -> str:
+    """Keep Fish S2 reference text attached to the matching voice."""
+    entry = _load_voice_entry(voice_id)
+    return str(entry.get("fish_ref_text") or "") if entry else ""
+
+
 def update_model_controls(model_backend: str) -> tuple:
     """Show only controls that affect the selected backend."""
     if model_backend == "IndexTTS 2.0":
-        return gr.update(visible=False), gr.update(interactive=True)
+        return gr.update(visible=False), gr.update(visible=False), gr.update(interactive=True)
     if model_backend == "OmniVoice":
-        return gr.update(visible=True), gr.update(interactive=False)
-    return gr.update(visible=False), gr.update(value="跟随参考音频", interactive=False)
+        return gr.update(visible=True), gr.update(visible=False), gr.update(interactive=False)
+    if model_backend == "Fish Audio S2 Pro":
+        return gr.update(visible=False), gr.update(visible=True), gr.update(interactive=False)
+    return (
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(value="跟随参考音频", interactive=False),
+    )
 
 
 def reset_advanced_settings() -> tuple:
@@ -2986,10 +3062,12 @@ def _resolve_emotion_backend(
 def _resolve_model_backend(
     model_backend: str,
     emotion_label: str,
-) -> tuple[IndexTTSv25 | IndexTTSv2 | OmniVoiceTTS, str | None, str | None, str]:
+) -> tuple[IndexTTSv25 | IndexTTSv2 | OmniVoiceTTS | FishS2ProTTS, str | None, str | None, str]:
     """Resolve an explicitly selected backend; never switch models implicitly."""
     if model_backend == "OmniVoice":
         return get_omnivoice_model(), None, None, "OmniVoice · 本地 MLX"
+    if model_backend == "Fish Audio S2 Pro":
+        return get_fish_s2_model(), None, None, "Fish Audio S2 Pro · MLX 8-bit"
     if model_backend == "IndexTTS 2.0":
         emotion = EMOTIONS.get(emotion_label)
         if emotion is None:
@@ -3001,7 +3079,7 @@ def _resolve_model_backend(
 def _analyze_backend_audio(audio, sample_rate: int, model_backend: str) -> dict:
     """Apply the spectral guard calibrated for each backend's codec/sample rate."""
     report = analyze_audio_quality(audio, sample_rate)
-    if model_backend != "OmniVoice":
+    if model_backend not in {"OmniVoice", "Fish Audio S2 Pro"}:
         return report
     high_frequency_issue = "检测到异常高频能量，可能存在啸叫或金属音"
     # OmniVoice's 24 kHz audio tokenizer naturally retains more 7–12 kHz
@@ -3046,6 +3124,15 @@ def _synthesize_unlocked(
     omnivoice_ref_audio_max_duration_s: float,
     output_format: str,
     output_directory: str,
+    fish_mode: str = "clone",
+    fish_ref_text: str = "",
+    fish_instruct: str = "",
+    fish_temperature: float = 0.7,
+    fish_top_p: float = 0.7,
+    fish_top_k: float = 30,
+    fish_max_tokens: float = 1024,
+    fish_chunk_length: float = 300,
+    fish_ref_audio_max_duration_s: float = 15.0,
     progress=gr.Progress(),
     batch_ready_callback: Callable[[str], None] | None = None,
 ) -> tuple[str | None, str, str]:
@@ -3055,7 +3142,11 @@ def _synthesize_unlocked(
     # The selector value is the single source of truth. Never fall back to the
     # former global current_voice cache, which may belong to a previously used voice.
     library_entry = _load_voice_entry(voice_library_id)
-    voice_required = model_backend != "OmniVoice" or omnivoice_mode == "clone"
+    voice_required = (
+        model_backend not in {"OmniVoice", "Fish Audio S2 Pro"}
+        or (model_backend == "OmniVoice" and omnivoice_mode == "clone")
+        or (model_backend == "Fish Audio S2 Pro" and fish_mode == "clone")
+    )
     if library_entry is None and voice_required:
         raise gr.Error("当前选择的音色不存在，请重新选择音色后再生成。")
     reference_audio = str(library_entry["source_path"]) if library_entry else ""
@@ -3109,10 +3200,11 @@ def _synthesize_unlocked(
             model_backend, emotion_label
         )
         use_v25_backend = model_backend == "IndexTTS 2.5"
-        if model_backend == "OmniVoice":
-            # OmniVoice performs its own exact 24 kHz preprocessing. Feeding the
-            # normalized 22.05 kHz IndexTTS preview here loses speaker detail.
-            reference = Path(reference_audio) if library_entry and omnivoice_mode == "clone" else None
+        if model_backend in {"OmniVoice", "Fish Audio S2 Pro"}:
+            # Both external MLX backends own their reference resampling. Feeding
+            # the normalized 22.05 kHz IndexTTS preview loses speaker detail.
+            clone_mode = omnivoice_mode if model_backend == "OmniVoice" else fish_mode
+            reference = Path(reference_audio) if library_entry and clone_mode == "clone" else None
         else:
             assert library_entry is not None and conditioning_key is not None
             conditioning_path = Path(str(library_entry[conditioning_key]))
@@ -3188,9 +3280,20 @@ def _synthesize_unlocked(
             omnivoice_t_shift,
             omnivoice_ref_audio_max_duration_s,
         )
-        if model_backend != "OmniVoice":
-            # IndexTTS caches are keyed by per-voice conditioning files. Keep the
-            # OmniVoice prompt cache so reference encoding/ASR runs only once.
+        save_fish_s2_settings(
+            fish_mode,
+            fish_ref_text,
+            fish_instruct,
+            fish_temperature,
+            fish_top_p,
+            fish_top_k,
+            fish_max_tokens,
+            fish_chunk_length,
+            fish_ref_audio_max_duration_s,
+        )
+        if model_backend not in {"OmniVoice", "Fish Audio S2 Pro"}:
+            # IndexTTS caches are keyed by per-voice conditioning files. Keep
+            # external-model prompt caches so reference encoding/ASR runs once.
             model.cache = {}
         requested_max_text_tokens = int(max_text_tokens)
         effective_max_text_tokens = requested_max_text_tokens
@@ -3292,6 +3395,21 @@ def _synthesize_unlocked(
                     t_shift=float(omnivoice_t_shift),
                     ref_audio_max_duration_s=float(omnivoice_ref_audio_max_duration_s),
                 )
+            elif model_backend == "Fish Audio S2 Pro":
+                generate_kwargs.update(
+                    fish_mode=fish_mode,
+                    ref_text=(
+                        fish_ref_text
+                        or (str(library_entry.get("fish_ref_text") or "") if library_entry else "")
+                    ),
+                    instruct=fish_instruct,
+                    temperature=float(fish_temperature),
+                    top_p=float(fish_top_p),
+                    top_k=int(fish_top_k),
+                    max_tokens=int(fish_max_tokens),
+                    chunk_length=int(fish_chunk_length),
+                    ref_audio_max_duration_s=float(fish_ref_audio_max_duration_s),
+                )
             generated_audio = model.generate(**generate_kwargs)
             if (
                 model_backend == "OmniVoice"
@@ -3304,6 +3422,18 @@ def _synthesize_unlocked(
                 library_entry = _update_voice_metadata(
                     str(library_entry["id"]),
                     omnivoice_ref_text=str(model.last_reference_transcript),
+                ) or library_entry
+            if (
+                model_backend == "Fish Audio S2 Pro"
+                and fish_mode == "clone"
+                and library_entry
+                and getattr(model, "last_reference_transcript", "")
+                and str(library_entry.get("fish_ref_text") or "")
+                != str(model.last_reference_transcript)
+            ):
+                library_entry = _update_voice_metadata(
+                    str(library_entry["id"]),
+                    fish_ref_text=str(model.last_reference_transcript),
                 ) or library_entry
             job_sample_rate = int(getattr(model, "sample_rate", VOICE_SAMPLE_RATE))
             quality_report = _analyze_backend_audio(generated_audio, job_sample_rate, model_backend)
@@ -3381,6 +3511,8 @@ def _synthesize_unlocked(
         reference_note = "OmniVoice 音色设计"
     elif model_backend == "OmniVoice" and omnivoice_mode == "auto":
         reference_note = "OmniVoice 自动音色"
+    elif model_backend == "Fish Audio S2 Pro" and fish_mode == "auto":
+        reference_note = "Fish S2 Pro 自动音色"
     else:
         assert library_entry is not None
         reference_note = f"自定义音色：{library_entry.get('name') or Path(reference_audio).name}"
@@ -3522,6 +3654,15 @@ def synthesize_document_queue_stream(
     omnivoice_ref_audio_max_duration_s: float,
     output_format: str,
     output_directory: str,
+    fish_mode: str = "clone",
+    fish_ref_text: str = "",
+    fish_instruct: str = "",
+    fish_temperature: float = 0.7,
+    fish_top_p: float = 0.7,
+    fish_top_k: float = 30,
+    fish_max_tokens: float = 1024,
+    fish_chunk_length: float = 300,
+    fish_ref_audio_max_duration_s: float = 15.0,
 ):
     """Generate every confirmed document sequentially in one protected job."""
     queue = _normalise_document_queue(queue_data)
@@ -3577,6 +3718,15 @@ def synthesize_document_queue_stream(
         omnivoice_ref_audio_max_duration_s,
         output_format,
         output_directory,
+        fish_mode,
+        fish_ref_text,
+        fish_instruct,
+        fish_temperature,
+        fish_top_p,
+        fish_top_k,
+        fish_max_tokens,
+        fish_chunk_length,
+        fish_ref_audio_max_duration_s,
     )
 
     def publish(message: str, *, audio: str | None = None, location: str | None = None) -> None:
@@ -3728,6 +3878,15 @@ def synthesize_stream(
     output_format: str,
     output_directory: str,
     live_playback: bool = False,
+    fish_mode: str = "clone",
+    fish_ref_text: str = "",
+    fish_instruct: str = "",
+    fish_temperature: float = 0.7,
+    fish_top_p: float = 0.7,
+    fish_top_k: float = 30,
+    fish_max_tokens: float = 1024,
+    fish_chunk_length: float = 300,
+    fish_ref_audio_max_duration_s: float = 15.0,
 ):
     """Stream progress and optionally autoplay each completed audio batch."""
     finished = threading.Event()
@@ -3775,6 +3934,15 @@ def synthesize_stream(
                 omnivoice_ref_audio_max_duration_s,
                 output_format,
                 output_directory,
+                fish_mode,
+                fish_ref_text,
+                fish_instruct,
+                fish_temperature,
+                fish_top_p,
+                fish_top_k,
+                fish_max_tokens,
+                fish_chunk_length,
+                fish_ref_audio_max_duration_s,
                 progress=lambda *_args, **_kwargs: None,
                 batch_ready_callback=(publish_completed_batch if live_playback else None),
             )
@@ -3855,6 +4023,7 @@ def build_ui() -> gr.Blocks:
     initial_omnivoice_ref_text = load_voice_omnivoice_transcript(
         initial_config.get("voice_library_id")
     )
+    initial_fish_ref_text = load_voice_fish_transcript(initial_config.get("voice_library_id"))
     with gr.Blocks(title=f"IndexTTS 2.5 专业语音工作台 · v{APP_VERSION}") as demo:
         document_state = gr.State(value=None)
         document_queue_state = gr.State(value=[])
@@ -3984,21 +4153,21 @@ def build_ui() -> gr.Blocks:
                 <span class="app-badge">Apple MLX</span>
                 <span class="app-badge">离线可用</span>
                 <span class="app-badge">22.05 kHz</span>
-                <button id="about-open" class="about-trigger" type="button">关于 / v0.2.1</button>
+                <button id="about-open" class="about-trigger" type="button">关于 / v0.3.0</button>
               </div>
             </header>
 
             <div id="about-modal" class="about-modal" aria-hidden="true">
               <section class="about-card" role="dialog" aria-modal="true" aria-labelledby="about-title">
                 <div class="about-card-head">
-                  <h2 id="about-title">IndexTTS WebUI · v0.2.1</h2>
+                  <h2 id="about-title">IndexTTS WebUI · v0.3.0</h2>
                   <button id="about-close" class="about-close" type="button" aria-label="关闭">×</button>
                 </div>
                 <div class="about-card-body">
                   <div class="about-current">
-                    <strong>当前应用版本：v0.2.1</strong><br>
-                    默认使用 IndexTTS 2.5，可切换 IndexTTS 2.0 与本地 OmniVoice MLX。
-                    三个大模型按需分时加载，避免同时占用统一内存。
+                    <strong>当前应用版本：v0.3.0</strong><br>
+                    默认使用 IndexTTS 2.5，可切换 IndexTTS 2.0、OmniVoice 与 Fish Audio S2 Pro。
+                    四个大模型按需分时加载，避免同时占用统一内存。
                   </div>
                   <table class="about-table">
                     <thead><tr><th>组件</th><th>当前版本 / 规格</th><th>状态与作用</th></tr></thead>
@@ -4006,16 +4175,27 @@ def build_ui() -> gr.Blocks:
                       <tr><td>IndexTTS 主模型</td><td><strong>2.5</strong></td><td><span class="version-installed">已安装、正在使用</span>；负责音色克隆、多语种语音生成和语速控制。</td></tr>
                       <tr><td>IndexTTS 2.0</td><td><strong>2.0</strong></td><td>在模型选择器中切换后，可使用平静、高兴、悲伤等具体情绪。</td></tr>
                       <tr><td>OmniVoice</td><td><strong>MLX bfloat16</strong></td><td>本地 24 kHz 多语种合成、音色克隆与文字音色设计；CC-BY-NC，非小米官方 MiMo。</td></tr>
+                      <tr><td>Fish Audio S2 Pro</td><td><strong>MLX 8-bit · 44.1 kHz</strong></td><td>Built with Fish Audio。约 5B 参数，支持音色克隆、自动音色、多说话人和文本内情绪标签；Fish Audio Research License，仅限研究及非商业使用。</td></tr>
                       <tr><td>GPT 声学 Token 模型</td><td>GPT 2.5、持久化 8-bit</td><td>自回归解码加速；音色与声码器等保真关键模块保持 FP32。</td></tr>
                       <tr><td>S2Mel</td><td>IndexTTS 2.5 CFM / DiT</td><td>将语音 Token 转换为 Mel 频谱，保持 FP32 以避免细节损失。</td></tr>
                       <tr><td>BigVGAN 声码器</td><td>2.5 内置高保真权重、22.05 kHz</td><td>将 Mel 频谱转成 WAV 波形；保持 FP32，不使用旧版快速降质路径。</td></tr>
                       <tr><td>MLX 推理引擎</td><td>0.31.1</td><td>运行于 Apple Silicon 统一内存和 GPU。</td></tr>
                       <tr><td>PyTorch</td><td>2.10.0（仅旧 2.0 回退）</td><td>2.5 主路径为 Torch-free MLX，不调用 PyTorch。</td></tr>
                       <tr><td>文档导入 / OCR</td><td>Calibre 9.13.0 / Tesseract 5</td><td>本机读取 TXT、MD、DOC、DOCX、PDF、EPUB、MOBI；扫描 PDF 使用本机中文 OCR。</td></tr>
-                      <tr><td>WebUI</td><td><strong>mlx-indextts 0.2.1</strong> + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持队列、长文分段、暂停、终止、实时试听与音质检查。</td></tr>
+                      <tr><td>WebUI</td><td><strong>mlx-indextts 0.3.0</strong> + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持四模型切换、独立参数、队列、长文分段、暂停、终止、实时试听与音质检查。</td></tr>
                     </tbody>
                   </table>
                   <div class="about-changelog-title">版本变更日志</div>
+                  <section class="about-release">
+                    <div class="about-release-head"><strong>v0.3.0</strong><span>2026-09-10 · Fish Audio S2 Pro 接入</span></div>
+                    <ul>
+                      <li>新增 Fish Audio S2 Pro 8-bit MLX 后端，输出 44.1 kHz 音频。</li>
+                      <li>支持克隆已选音色、自动音色、多说话人标签和文本内情绪控制标签。</li>
+                      <li>开放温度、Top-P、Top-K、最大 Token、长文分块、风格指令及参考音频时长参数。</li>
+                      <li>参考原文可由本地 Qwen3-ASR 自动识别并按音色独立缓存。</li>
+                      <li>标明 Fish Audio Research License：研究和非商业使用免费，商业用途需单独授权。</li>
+                    </ul>
+                  </section>
                   <section class="about-release">
                     <div class="about-release-head"><strong>v0.2.1</strong><span>2026-09-10 · OmniVoice 克隆质量修复</span></div>
                     <ul>
@@ -4288,7 +4468,7 @@ def build_ui() -> gr.Blocks:
                             label="合成模型",
                             choices=list(MODEL_BACKENDS),
                             value=initial_config["model_backend"],
-                            info="2.5 高保真克隆；2.0 可控情绪；OmniVoice 是本地 MLX 多语种模型。",
+                            info="2.5 高保真克隆；2.0 可控情绪；OmniVoice 与 Fish S2 Pro 为本地 MLX 模型。",
                         )
                         emotion = gr.Dropdown(
                             label="表达方式 / 情绪",
@@ -4360,6 +4540,35 @@ def build_ui() -> gr.Blocks:
                             with gr.Row():
                                 omnivoice_t_shift = gr.Number(label="T-Shift", value=initial_config["omnivoice_t_shift"], minimum=0, maximum=1, step=0.01)
                                 omnivoice_ref_audio_max_duration_s = gr.Number(label="参考音频最长（秒）", value=initial_config["omnivoice_ref_audio_max_duration_s"], minimum=3, maximum=30, step=0.5)
+                        with gr.Group(visible=initial_config["model_backend"] == "Fish Audio S2 Pro") as fish_s2_controls:
+                            gr.Markdown(
+                                "**Fish Audio S2 Pro 参数**  本机使用 8-bit MLX 权重，输出 44.1 kHz。"
+                                "权重仅限研究及非商业使用；商业用途需要 Fish Audio 单独授权。"
+                            )
+                            fish_mode = gr.Dropdown(
+                                label="Fish S2 Pro 工作模式",
+                                choices=[("克隆已选音色", "clone"), ("自动音色 / 多说话人", "auto")],
+                                value=initial_config["fish_mode"],
+                            )
+                            fish_ref_text = gr.Textbox(
+                                label="参考音频原文（留空将自动识别并按音色缓存）",
+                                value=initial_fish_ref_text,
+                                lines=2,
+                            )
+                            fish_instruct = gr.Textbox(
+                                label="全局风格指令（可留空）",
+                                value=initial_config["fish_instruct"],
+                                placeholder="例如：professional broadcast tone；文本内还可加入 [whisper]、[laughing] 等标签",
+                                lines=2,
+                            )
+                            with gr.Row():
+                                fish_temperature = gr.Number(label="采样温度", value=initial_config["fish_temperature"], minimum=0, maximum=2, step=0.05)
+                                fish_top_p = gr.Number(label="Top-P", value=initial_config["fish_top_p"], minimum=0.05, maximum=1, step=0.05)
+                                fish_top_k = gr.Number(label="Top-K", value=initial_config["fish_top_k"], minimum=1, maximum=200, step=1, precision=0)
+                            with gr.Row():
+                                fish_max_tokens = gr.Number(label="最大音频 Token", value=initial_config["fish_max_tokens"], minimum=128, maximum=4096, step=128, precision=0)
+                                fish_chunk_length = gr.Number(label="长文分块字节数", value=initial_config["fish_chunk_length"], minimum=100, maximum=1000, step=50, precision=0)
+                                fish_ref_audio_max_duration_s = gr.Number(label="参考音频最长（秒）", value=initial_config["fish_ref_audio_max_duration_s"], minimum=3, maximum=30, step=0.5)
                     with gr.Row(elem_classes=["compact-generation-controls"]):
                         generate_button = gr.Button(
                             "开始生成",
@@ -4577,6 +4786,12 @@ def build_ui() -> gr.Blocks:
             outputs=[omnivoice_ref_text],
             queue=False,
         )
+        voice_library_selector.change(
+            fn=load_voice_fish_transcript,
+            inputs=[voice_library_selector],
+            outputs=[fish_ref_text],
+            queue=False,
+        )
 
         for quick_button, quick_remove_button, quick_state in zip(
             quick_voice_buttons, quick_voice_remove_buttons, quick_voice_states
@@ -4598,6 +4813,12 @@ def build_ui() -> gr.Blocks:
                 fn=load_voice_omnivoice_transcript,
                 inputs=[voice_library_selector],
                 outputs=[omnivoice_ref_text],
+                queue=False,
+            )
+            quick_select_event.then(
+                fn=load_voice_fish_transcript,
+                inputs=[voice_library_selector],
+                outputs=[fish_ref_text],
                 queue=False,
             )
             remove_favorite_event = quick_remove_button.click(
@@ -4698,6 +4919,12 @@ def build_ui() -> gr.Blocks:
                 outputs=[omnivoice_ref_text],
                 queue=False,
             )
+            reference_audio_event.then(
+                fn=load_voice_fish_transcript,
+                inputs=[voice_library_selector],
+                outputs=[fish_ref_text],
+                queue=False,
+            )
 
         advanced_inputs = [
             interval_silence,
@@ -4792,10 +5019,27 @@ def build_ui() -> gr.Blocks:
                 inputs=omnivoice_inputs,
                 queue=False,
             )
+        fish_s2_inputs = [
+            fish_mode,
+            fish_ref_text,
+            fish_instruct,
+            fish_temperature,
+            fish_top_p,
+            fish_top_k,
+            fish_max_tokens,
+            fish_chunk_length,
+            fish_ref_audio_max_duration_s,
+        ]
+        for fish_component in fish_s2_inputs:
+            fish_component.change(
+                fn=save_fish_s2_settings,
+                inputs=fish_s2_inputs,
+                queue=False,
+            )
         model_backend.change(
             fn=update_model_controls,
             inputs=[model_backend],
-            outputs=[omnivoice_controls, emotion],
+            outputs=[omnivoice_controls, fish_s2_controls, emotion],
             queue=False,
         )
 
@@ -4984,6 +5228,7 @@ def build_ui() -> gr.Blocks:
                 output_format,
                 output_directory,
                 live_playback,
+                *fish_s2_inputs,
             ],
             outputs=[
                 output_audio,
@@ -5020,6 +5265,7 @@ def build_ui() -> gr.Blocks:
                 *omnivoice_inputs,
                 output_format,
                 output_directory,
+                *fish_s2_inputs,
             ],
             outputs=[
                 document_queue_state,

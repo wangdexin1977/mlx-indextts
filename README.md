@@ -2,20 +2,30 @@
 
 IndexTTS for Apple Silicon using MLX. Zero-shot text-to-speech with voice cloning capabilities.
 
-Current WebUI release: **v0.2.1**. See [CHANGELOG.md](CHANGELOG.md) for the
+Current WebUI release: **v0.3.0**. See [CHANGELOG.md](CHANGELOG.md) for the
 version history; every release must update both that file and the in-app
 "About / Version" panel.
 
 ## WebUI model switching
 
-The WebUI can switch between IndexTTS 2.5, IndexTTS 2.0 and the local MLX
-OmniVoice backend. OmniVoice supports voice cloning, text-described voice
-design and automatic voices, and is loaded only when selected.
+The WebUI can switch between IndexTTS 2.5, IndexTTS 2.0, OmniVoice and Fish
+Audio S2 Pro. OmniVoice supports voice cloning, text-described voice design
+and automatic voices. Fish S2 Pro supports cloning, automatic/multi-speaker
+generation, inline expression tags and dedicated sampling controls. Models are
+loaded only when selected.
+
+Fish S2 Pro uses the 8-bit MLX conversion and is governed by the Fish Audio
+Research License: research and non-commercial use are free; commercial use
+requires a separate Fish Audio license.
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution and the
+upstream license link.
 
 ```bash
-uv add mlx-audio==0.4.4
+uv add mlx-audio==0.4.6
 uv run hf download mlx-community/OmniVoice-bfloat16 \
   --local-dir models/OmniVoice-bfloat16
+uv run hf download mlx-community/fish-audio-s2-pro-8bit \
+  --local-dir models/fish-audio-s2-pro-8bit
 uv run hf download mlx-community/Qwen3-ASR-0.6B-8bit \
   --local-dir models/Qwen3-ASR-0.6B-8bit
 ```

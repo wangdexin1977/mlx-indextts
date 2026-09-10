@@ -731,11 +731,37 @@ def test_about_panel_and_changelog_track_current_release():
     source = inspect.getsource(webui.build_ui)
     changelog = (webui.PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert webui.APP_VERSION == "0.2.1"
-    assert "关于 / v0.2.1" in source
+    assert webui.APP_VERSION == "0.3.0"
+    assert "关于 / v0.3.0" in source
     assert "版本变更日志" in source
+    assert "v0.3.0" in changelog
     assert "v0.2.1" in changelog
     assert "v0.2.0" in changelog
+
+
+def test_fish_s2_backend_has_dedicated_controls_and_dispatch(monkeypatch):
+    fish_model = object()
+    monkeypatch.setattr(webui, "get_fish_s2_model", lambda: fish_model)
+
+    assert "Fish Audio S2 Pro" in webui.MODEL_BACKENDS
+    assert webui._resolve_model_backend("Fish Audio S2 Pro", "跟随参考音频") == (
+        fish_model,
+        None,
+        None,
+        "Fish Audio S2 Pro · MLX 8-bit",
+    )
+
+    demo = webui.build_ui()
+    labels = {
+        component.get("props", {}).get("label")
+        for component in demo.config["components"]
+    }
+    assert {
+        "Fish S2 Pro 工作模式",
+        "全局风格指令（可留空）",
+        "最大音频 Token",
+        "长文分块字节数",
+    } <= labels
 
 
 def test_page_restore_keeps_conditioning_for_identical_temporary_copy(tmp_path: Path, monkeypatch):

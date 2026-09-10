@@ -1,0 +1,230 @@
+"""WebUI adapter for the local MLX Fish Audio S2 Pro model."""
+
+from __future__ import annotations
+
+import gc
+import hashlib
+import re
+import tempfile
+import time
+from pathlib import Path
+from typing import Callable
+
+import numpy as np
+import soundfile as sf
+
+from mlx_indextts.generate_v2 import GenerationCancelled
+
+
+SAMPLE_RATE = 44_100
+
+
+class _TokenizerAdapter:
+    def __init__(self, owner: "FishS2ProTTS") -> None:
+        self.owner = owner
+
+    def tokenize(self, text: str) -> str:
+        return text
+
+    def split_segments(self, text: str, max_tokens_per_segment: int = 120) -> list[str]:
+        return self.owner.split_text(text, max_tokens_per_segment)
+
+
+class FishS2ProTTS:
+    """Match the generation contract used by the multi-model WebUI."""
+
+    sample_rate = SAMPLE_RATE
+
+    def __init__(self, model_dir: str, asr_model_dir: str | None = None) -> None:
+        from mlx_audio.tts.utils import load_model
+
+        self.model_dir = str(model_dir)
+        self.asr_model_dir = str(asr_model_dir) if asr_model_dir else None
+        self.runtime = load_model(Path(model_dir))
+        self.sample_rate = int(self.runtime.sample_rate)
+        self.tokenizer = _TokenizerAdapter(self)
+        self.cache: dict[str, tuple[object, str]] = {}
+        self.last_reference_transcript = ""
+        self.last_quality_fallback_used = False
+        self.last_speed_optimization_used = False
+
+    @staticmethod
+    def split_text(text: str, max_tokens_per_segment: int = 120) -> list[str]:
+        limit = max(40, min(300, int(max_tokens_per_segment)))
+        units = re.split(r"(?<=[。！？；，.!?;,\n])", str(text))
+        pieces: list[str] = []
+        current = ""
+        for unit in units:
+            while len(unit.encode("utf-8")) > limit * 3:
+                if current.strip():
+                    pieces.append(current.strip())
+                    current = ""
+                cut = min(len(unit), limit)
+                pieces.append(unit[:cut].strip())
+                unit = unit[cut:]
+            if current and len((current + unit).encode("utf-8")) > limit * 3:
+                pieces.append(current.strip())
+                current = unit
+            else:
+                current += unit
+        if current.strip():
+            pieces.append(current.strip())
+        return [piece for piece in pieces if piece]
+
+    @staticmethod
+    def _reference_cache_key(reference_audio: str, max_duration_s: float) -> str:
+        path = Path(reference_audio).resolve()
+        stat = path.stat()
+        source = f"{path}:{stat.st_size}:{stat.st_mtime_ns}:{float(max_duration_s):.2f}"
+        return hashlib.sha256(source.encode()).hexdigest()
+
+    def _prepare_reference(
+        self, reference_audio: str, ref_text: str, max_duration_s: float
+    ) -> tuple[object, str]:
+        import mlx.core as mx
+        from mlx_audio.utils import load_audio
+
+        key = self._reference_cache_key(reference_audio, max_duration_s)
+        manual_text = str(ref_text or "").strip()
+        cached = self.cache.get(key)
+        if cached is not None and (not manual_text or manual_text == cached[1]):
+            self.last_reference_transcript = cached[1]
+            return cached
+
+        audio = load_audio(
+            str(reference_audio),
+            sample_rate=self.sample_rate,
+        )
+        max_samples = int(self.sample_rate * max(3.0, float(max_duration_s)))
+        if int(audio.shape[0]) > max_samples:
+            audio = audio[:max_samples]
+        aligned_text = manual_text
+        if not aligned_text:
+            if not self.asr_model_dir or not Path(self.asr_model_dir).is_dir():
+                raise ValueError("Fish S2 Pro 克隆需要参考音频原文，或安装本地 ASR 模型。")
+            from mlx_audio.stt.utils import load_model as load_stt
+
+            temporary_name = ""
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temporary:
+                    temporary_name = temporary.name
+                sf.write(
+                    temporary_name,
+                    np.asarray(audio, dtype=np.float32),
+                    self.sample_rate,
+                    subtype="PCM_16",
+                )
+                stt = load_stt(Path(self.asr_model_dir))
+                transcription = stt.generate(temporary_name)
+                aligned_text = str(getattr(transcription, "text", "") or "").strip()
+                del stt
+            finally:
+                if temporary_name:
+                    Path(temporary_name).unlink(missing_ok=True)
+                gc.collect()
+                mx.clear_cache()
+            if not aligned_text:
+                raise RuntimeError("ASR 未能识别参考音频，请填写参考原文或更换清晰人声。")
+
+        prepared = (audio, aligned_text)
+        self.cache[key] = prepared
+        self.last_reference_transcript = aligned_text
+        return prepared
+
+    @staticmethod
+    def _join_audio(segments: list[np.ndarray], interval_silence: int, sample_rate: int) -> np.ndarray:
+        if len(segments) == 1:
+            return segments[0]
+        silence = np.zeros(int(sample_rate * max(0, interval_silence) / 1000), np.float32)
+        joined: list[np.ndarray] = []
+        for index, segment in enumerate(segments):
+            if index and silence.size:
+                joined.append(silence)
+            joined.append(segment)
+        return np.concatenate(joined)
+
+    def generate(
+        self,
+        *,
+        text: str,
+        reference_audio: str | None,
+        output_path: str,
+        speed: float = 1.0,
+        seed: int = 42,
+        max_text_tokens_per_segment: int = 120,
+        interval_silence: int = 250,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+        audio_chunk_callback: Callable[[np.ndarray, int], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+        pause_requested: Callable[[], bool] | None = None,
+        fish_mode: str = "clone",
+        ref_text: str = "",
+        instruct: str = "",
+        temperature: float = 0.7,
+        top_p: float = 0.7,
+        top_k: int = 30,
+        max_tokens: int = 1024,
+        chunk_length: int = 300,
+        ref_audio_max_duration_s: float = 15.0,
+        **_ignored,
+    ) -> np.ndarray:
+        import mlx.core as mx
+
+        mode = str(fish_mode or "clone")
+        if mode == "clone" and not reference_audio:
+            raise ValueError("Fish S2 Pro 音色克隆需要先选择一个参考音色。")
+
+        pieces = self.split_text(text, max_text_tokens_per_segment)
+        ref_audio = None
+        aligned_ref_text = ""
+        if mode == "clone":
+            if progress_callback:
+                progress_callback(0, len(pieces), "正在对齐 Fish S2 Pro 参考音频与原文")
+            ref_audio, aligned_ref_text = self._prepare_reference(
+                str(reference_audio), str(ref_text or ""), float(ref_audio_max_duration_s)
+            )
+
+        generated: list[np.ndarray] = []
+        for index, piece in enumerate(pieces, start=1):
+            while pause_requested and pause_requested():
+                if cancel_requested and cancel_requested():
+                    raise GenerationCancelled("用户已终止当前任务")
+                time.sleep(0.1)
+            if cancel_requested and cancel_requested():
+                raise GenerationCancelled("用户已终止当前任务")
+            if progress_callback:
+                progress_callback(index - 1, len(pieces), f"Fish S2 Pro 片段 {index}/{len(pieces)}")
+
+            mx.random.seed(int(seed) + index - 1)
+            results = list(
+                self.runtime.generate(
+                    text=piece,
+                    ref_audio=ref_audio,
+                    ref_text=aligned_ref_text or None,
+                    instruct=str(instruct or "").strip() or None,
+                    temperature=float(temperature),
+                    top_p=float(top_p),
+                    top_k=int(top_k),
+                    max_tokens=int(max_tokens),
+                    speed=float(speed),
+                    chunk_length=int(chunk_length),
+                    stream=False,
+                    verbose=False,
+                )
+            )
+            if not results:
+                raise RuntimeError("Fish S2 Pro 未返回音频。")
+            for result in results:
+                audio = np.asarray(result.audio, dtype=np.float32).squeeze()
+                audio = np.clip(audio, -1.0, 1.0)
+                generated.append(audio)
+                if audio_chunk_callback:
+                    audio_chunk_callback(audio, self.sample_rate)
+            if progress_callback:
+                progress_callback(index, len(pieces), f"Fish S2 Pro 片段 {index}/{len(pieces)} 已完成")
+
+        joined = self._join_audio(generated, int(interval_silence), self.sample_rate)
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(str(target), joined, self.sample_rate, subtype="PCM_16")
+        return joined
