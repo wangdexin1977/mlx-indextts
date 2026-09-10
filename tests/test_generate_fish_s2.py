@@ -2,8 +2,10 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import soundfile as sf
 
 from mlx_indextts.generate_fish_s2 import FishS2ProTTS
+from mlx_indextts.generate_v2 import GenerationCancelled
 
 
 def _adapter_with_runtime(runtime) -> FishS2ProTTS:
@@ -17,7 +19,7 @@ def _adapter_with_runtime(runtime) -> FishS2ProTTS:
     return adapter
 
 
-def test_fish_generation_preserves_long_form_context_and_retries_token_cap(tmp_path):
+def test_fish_generation_uses_bounded_segments_and_retries_only_capped_piece(tmp_path):
     class Runtime:
         def __init__(self):
             self.calls = []
@@ -47,9 +49,48 @@ def test_fish_generation_preserves_long_form_context_and_retries_token_cap(tmp_p
         chunk_length=300,
     )
 
-    assert [call["max_tokens"] for call in runtime.calls] == [1024, 2048]
-    assert all(call["text"] == text for call in runtime.calls)
+    assert [call["max_tokens"] for call in runtime.calls[:2]] == [1024, 2048]
+    assert runtime.calls[0]["text"] == runtime.calls[1]["text"]
+    successful_calls = runtime.calls[1:]
+    assert "".join(call["text"] for call in successful_calls) == text
+    assert all(len(call["text"]) <= 60 for call in runtime.calls)
     assert target.is_file()
+    assert not (tmp_path / "fish.partial.wav").exists()
+
+
+def test_fish_cancel_preserves_each_completed_segment(tmp_path):
+    class Runtime:
+        @staticmethod
+        def generate(**_kwargs):
+            return [
+                SimpleNamespace(
+                    audio=np.linspace(-0.1, 0.1, 4_410, dtype=np.float32),
+                    token_count=200,
+                )
+            ]
+
+    adapter = _adapter_with_runtime(Runtime())
+    target = tmp_path / "cancelled.wav"
+    cancelled = [False]
+
+    def progress(current, _total, _message):
+        if current == 1:
+            cancelled[0] = True
+
+    with pytest.raises(GenerationCancelled):
+        adapter.generate(
+            text="第一段应该完成并保存。" * 6,
+            reference_audio=None,
+            output_path=str(target),
+            fish_mode="auto",
+            progress_callback=progress,
+            cancel_requested=lambda: cancelled[0],
+        )
+
+    partial = tmp_path / "cancelled.partial.wav"
+    assert partial.is_file()
+    assert sf.info(partial).duration > 0
+    assert not target.exists()
 
 
 def test_fish_generation_rejects_audio_still_capped_at_safety_limit(tmp_path):

@@ -756,9 +756,10 @@ def test_about_panel_and_changelog_track_current_release():
     source = inspect.getsource(webui.build_ui)
     changelog = (webui.PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert webui.APP_VERSION == "0.3.2"
-    assert "关于 / v0.3.2" in source
+    assert webui.APP_VERSION == "0.3.3"
+    assert "关于 / v0.3.3" in source
     assert "版本变更日志" in source
+    assert "v0.3.3" in changelog
     assert "v0.3.2" in changelog
     assert "v0.3.1" in changelog
     assert "v0.3.0" in changelog
@@ -787,7 +788,7 @@ def test_fish_s2_backend_has_dedicated_controls_and_dispatch(monkeypatch):
         "Fish S2 Pro 工作模式",
         "全局风格指令（可留空）",
         "最大音频 Token",
-        "长文分块字节数",
+        "多说话人批次字节数",
     } <= labels
     token_control = next(
         component

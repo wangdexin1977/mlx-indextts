@@ -44,7 +44,7 @@ from mlx_indextts.power_monitor import start_macos_power_monitor
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 MODEL_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2.5-int8"
 MODEL_V2_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2"
 OMNIVOICE_MODEL_DIR = PROJECT_ROOT / "models" / "OmniVoice-bfloat16"
@@ -3053,11 +3053,11 @@ def terminate_generation() -> tuple[str, str]:
             _generation_progress_state.update(
                 state="cancelling",
                 paused_at=None,
-                message="正在安全终止并保存已完成片段",
+                message="已收到终止请求：当前短片段结束后立即保存并停止",
             )
         if _document_queue_active.is_set():
             return "暂停转换", "正在终止文档队列……当前文档已完成的片段将保留，后续文档不再启动。"
-        return "暂停转换", "正在终止任务……已完成的音频片段将自动保留。"
+        return "暂停转换", "正在终止任务：当前短片段完成后立即停止，已生成音频将自动保留。"
 
 
 def _wait_for_generation_control() -> None:
@@ -4157,19 +4157,19 @@ def build_ui() -> gr.Blocks:
                 <span class="app-badge">Apple MLX</span>
                 <span class="app-badge">离线可用</span>
                 <span class="app-badge">22.05 kHz</span>
-                <button id="about-open" class="about-trigger" type="button">关于 / v0.3.2</button>
+                <button id="about-open" class="about-trigger" type="button">关于 / v0.3.3</button>
               </div>
             </header>
 
             <div id="about-modal" class="about-modal" aria-hidden="true">
               <section class="about-card" role="dialog" aria-modal="true" aria-labelledby="about-title">
                 <div class="about-card-head">
-                  <h2 id="about-title">IndexTTS WebUI · v0.3.2</h2>
+                  <h2 id="about-title">IndexTTS WebUI · v0.3.3</h2>
                   <button id="about-close" class="about-close" type="button" aria-label="关闭">×</button>
                 </div>
                 <div class="about-card-body">
                   <div class="about-current">
-                    <strong>当前应用版本：v0.3.2</strong><br>
+                    <strong>当前应用版本：v0.3.3</strong><br>
                     默认使用 IndexTTS 2.5，可切换 IndexTTS 2.0、OmniVoice 与 Fish Audio S2 Pro。
                     四个大模型按需分时加载，避免同时占用统一内存。
                   </div>
@@ -4186,10 +4186,19 @@ def build_ui() -> gr.Blocks:
                       <tr><td>MLX 推理引擎</td><td>0.31.1</td><td>运行于 Apple Silicon 统一内存和 GPU。</td></tr>
                       <tr><td>PyTorch</td><td>2.10.0（仅旧 2.0 回退）</td><td>2.5 主路径为 Torch-free MLX，不调用 PyTorch。</td></tr>
                       <tr><td>文档导入 / OCR</td><td>Calibre 9.13.0 / Tesseract 5</td><td>本机读取 TXT、MD、DOC、DOCX、PDF、EPUB、MOBI；扫描 PDF 使用本机中文 OCR。</td></tr>
-                      <tr><td>WebUI</td><td><strong>mlx-indextts 0.3.2</strong> + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持四模型切换、独立参数、队列、长文分段、暂停、终止、实时试听与音质检查。</td></tr>
+                      <tr><td>WebUI</td><td><strong>mlx-indextts 0.3.3</strong> + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持四模型切换、独立参数、队列、长文分段、暂停、终止、实时试听与音质检查。</td></tr>
                     </tbody>
                   </table>
                   <div class="about-changelog-title">版本变更日志</div>
+                  <section class="about-release">
+                    <div class="about-release-head"><strong>v0.3.3</strong><span>2026-09-10 · Fish 长文进度与内存修复</span></div>
+                    <ul>
+                      <li>修复普通单人长文未被 MLX 内部分块、长期停在 0% 并最终触发 Metal 内存溢出的问题。</li>
+                      <li>改为最多 60 字的标点优先安全段，每完成一段立即刷新百分比与剩余时间。</li>
+                      <li>生成过程持续写入部分音频，安全终止时保留已完成段落。</li>
+                      <li>每段后释放 MLX 临时缓存，避免长任务内存持续增长。</li>
+                    </ul>
+                  </section>
                   <section class="about-release">
                     <div class="about-release-head"><strong>v0.3.2</strong><span>2026-09-10 · Fish S2 Pro 突停修复</span></div>
                     <ul>
@@ -4596,7 +4605,15 @@ def build_ui() -> gr.Blocks:
                                     step=256,
                                     precision=0,
                                 )
-                                fish_chunk_length = gr.Number(label="长文分块字节数", value=initial_config["fish_chunk_length"], minimum=100, maximum=1000, step=50, precision=0)
+                                fish_chunk_length = gr.Number(
+                                    label="多说话人批次字节数",
+                                    info="用于含 <|speaker:n|> 标签的 Fish 内部分组；普通单人长文由程序按标点安全分段。",
+                                    value=initial_config["fish_chunk_length"],
+                                    minimum=100,
+                                    maximum=1000,
+                                    step=50,
+                                    precision=0,
+                                )
                                 fish_ref_audio_max_duration_s = gr.Number(label="参考音频最长（秒）", value=initial_config["fish_ref_audio_max_duration_s"], minimum=3, maximum=30, step=0.5)
                     with gr.Row(elem_classes=["compact-generation-controls"]):
                         generate_button = gr.Button(
