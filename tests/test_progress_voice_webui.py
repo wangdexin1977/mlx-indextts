@@ -264,6 +264,14 @@ def test_invalid_saved_output_format_falls_back_to_wav(tmp_path: Path, monkeypat
     assert webui.read_user_config()["output_format"] == "wav"
 
 
+def test_legacy_fish_token_limit_is_migrated_to_safe_minimum(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "settings.json"
+    config_path.write_text('{"fish_max_tokens": 256}', encoding="utf-8")
+    monkeypatch.setattr(webui, "CONFIG_PATH", config_path)
+
+    assert webui.read_user_config()["fish_max_tokens"] == 1024
+
+
 def test_default_audio_filename_uses_first_fifteen_copy_characters():
     text = "  第一行 文案\n第二行继续，这是额外内容"
 
@@ -748,9 +756,10 @@ def test_about_panel_and_changelog_track_current_release():
     source = inspect.getsource(webui.build_ui)
     changelog = (webui.PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert webui.APP_VERSION == "0.3.1"
-    assert "关于 / v0.3.1" in source
+    assert webui.APP_VERSION == "0.3.2"
+    assert "关于 / v0.3.2" in source
     assert "版本变更日志" in source
+    assert "v0.3.2" in changelog
     assert "v0.3.1" in changelog
     assert "v0.3.0" in changelog
     assert "v0.2.1" in changelog
@@ -780,6 +789,12 @@ def test_fish_s2_backend_has_dedicated_controls_and_dispatch(monkeypatch):
         "最大音频 Token",
         "长文分块字节数",
     } <= labels
+    token_control = next(
+        component
+        for component in demo.config["components"]
+        if component.get("props", {}).get("label") == "最大音频 Token"
+    )
+    assert token_control["props"]["minimum"] == 1024
 
 
 def test_page_restore_keeps_conditioning_for_identical_temporary_copy(tmp_path: Path, monkeypatch):

@@ -44,7 +44,7 @@ from mlx_indextts.power_monitor import start_macos_power_monitor
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 MODEL_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2.5-int8"
 MODEL_V2_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2"
 OMNIVOICE_MODEL_DIR = PROJECT_ROOT / "models" / "OmniVoice-bfloat16"
@@ -1262,6 +1262,11 @@ def _read_config_unlocked() -> dict:
         config["output_format"] = "wav"
     if not str(config.get("output_directory") or "").strip():
         config["output_directory"] = str(OUTPUT_DIR)
+    try:
+        if int(config.get("fish_max_tokens") or 0) < FishS2ProTTS.MIN_AUDIO_TOKENS:
+            config["fish_max_tokens"] = FishS2ProTTS.MIN_AUDIO_TOKENS
+    except (TypeError, ValueError):
+        config["fish_max_tokens"] = FishS2ProTTS.MIN_AUDIO_TOKENS
     return config
 
 
@@ -2485,7 +2490,7 @@ def save_fish_s2_settings(
         fish_temperature=float(temperature),
         fish_top_p=float(top_p),
         fish_top_k=int(top_k),
-        fish_max_tokens=int(max_tokens),
+        fish_max_tokens=max(FishS2ProTTS.MIN_AUDIO_TOKENS, int(max_tokens)),
         fish_chunk_length=int(chunk_length),
         fish_ref_audio_max_duration_s=float(ref_audio_max_duration_s),
     )
@@ -4152,19 +4157,19 @@ def build_ui() -> gr.Blocks:
                 <span class="app-badge">Apple MLX</span>
                 <span class="app-badge">离线可用</span>
                 <span class="app-badge">22.05 kHz</span>
-                <button id="about-open" class="about-trigger" type="button">关于 / v0.3.1</button>
+                <button id="about-open" class="about-trigger" type="button">关于 / v0.3.2</button>
               </div>
             </header>
 
             <div id="about-modal" class="about-modal" aria-hidden="true">
               <section class="about-card" role="dialog" aria-modal="true" aria-labelledby="about-title">
                 <div class="about-card-head">
-                  <h2 id="about-title">IndexTTS WebUI · v0.3.1</h2>
+                  <h2 id="about-title">IndexTTS WebUI · v0.3.2</h2>
                   <button id="about-close" class="about-close" type="button" aria-label="关闭">×</button>
                 </div>
                 <div class="about-card-body">
                   <div class="about-current">
-                    <strong>当前应用版本：v0.3.1</strong><br>
+                    <strong>当前应用版本：v0.3.2</strong><br>
                     默认使用 IndexTTS 2.5，可切换 IndexTTS 2.0、OmniVoice 与 Fish Audio S2 Pro。
                     四个大模型按需分时加载，避免同时占用统一内存。
                   </div>
@@ -4181,10 +4186,19 @@ def build_ui() -> gr.Blocks:
                       <tr><td>MLX 推理引擎</td><td>0.31.1</td><td>运行于 Apple Silicon 统一内存和 GPU。</td></tr>
                       <tr><td>PyTorch</td><td>2.10.0（仅旧 2.0 回退）</td><td>2.5 主路径为 Torch-free MLX，不调用 PyTorch。</td></tr>
                       <tr><td>文档导入 / OCR</td><td>Calibre 9.13.0 / Tesseract 5</td><td>本机读取 TXT、MD、DOC、DOCX、PDF、EPUB、MOBI；扫描 PDF 使用本机中文 OCR。</td></tr>
-                      <tr><td>WebUI</td><td><strong>mlx-indextts 0.3.1</strong> + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持四模型切换、独立参数、队列、长文分段、暂停、终止、实时试听与音质检查。</td></tr>
+                      <tr><td>WebUI</td><td><strong>mlx-indextts 0.3.2</strong> + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持四模型切换、独立参数、队列、长文分段、暂停、终止、实时试听与音质检查。</td></tr>
                     </tbody>
                   </table>
                   <div class="about-changelog-title">版本变更日志</div>
+                  <section class="about-release">
+                    <div class="about-release-head"><strong>v0.3.2</strong><span>2026-09-10 · Fish S2 Pro 突停修复</span></div>
+                    <ul>
+                      <li>修复 256 音频 Token 造成约每 12 秒硬截断一次的问题，安全下限调整为 1024。</li>
+                      <li>触及 Token 上限时自动扩大并重新生成；达到 4096 仍未结束则拒绝保存残缺音频。</li>
+                      <li>长文交由 Fish 原生分块器连续生成，保留上下文并减少段落重置停顿。</li>
+                      <li>已有低 Token 旧配置自动迁移，无需手工恢复默认参数。</li>
+                    </ul>
+                  </section>
                   <section class="about-release">
                     <div class="about-release-head"><strong>v0.3.1</strong><span>2026-09-10 · 音频按文案开头命名</span></div>
                     <ul>
@@ -4573,7 +4587,15 @@ def build_ui() -> gr.Blocks:
                                 fish_top_p = gr.Number(label="Top-P", value=initial_config["fish_top_p"], minimum=0.05, maximum=1, step=0.05)
                                 fish_top_k = gr.Number(label="Top-K", value=initial_config["fish_top_k"], minimum=1, maximum=200, step=1, precision=0)
                             with gr.Row():
-                                fish_max_tokens = gr.Number(label="最大音频 Token", value=initial_config["fish_max_tokens"], minimum=128, maximum=4096, step=128, precision=0)
+                                fish_max_tokens = gr.Number(
+                                    label="最大音频 Token",
+                                    info="最低 1024；过小会在一句话尚未读完时硬截断。达到上限时程序会自动扩大并重试。",
+                                    value=initial_config["fish_max_tokens"],
+                                    minimum=1024,
+                                    maximum=4096,
+                                    step=256,
+                                    precision=0,
+                                )
                                 fish_chunk_length = gr.Number(label="长文分块字节数", value=initial_config["fish_chunk_length"], minimum=100, maximum=1000, step=50, precision=0)
                                 fish_ref_audio_max_duration_s = gr.Number(label="参考音频最长（秒）", value=initial_config["fish_ref_audio_max_duration_s"], minimum=3, maximum=30, step=0.5)
                     with gr.Row(elem_classes=["compact-generation-controls"]):

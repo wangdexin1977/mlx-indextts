@@ -34,6 +34,8 @@ class FishS2ProTTS:
     """Match the generation contract used by the multi-model WebUI."""
 
     sample_rate = SAMPLE_RATE
+    MIN_AUDIO_TOKENS = 1024
+    MAX_AUDIO_TOKENS = 4096
 
     def __init__(self, model_dir: str, asr_model_dir: str | None = None) -> None:
         from mlx_audio.tts.utils import load_model
@@ -174,54 +176,87 @@ class FishS2ProTTS:
         if mode == "clone" and not reference_audio:
             raise ValueError("Fish S2 Pro 音色克隆需要先选择一个参考音色。")
 
-        pieces = self.split_text(text, max_text_tokens_per_segment)
+        planned_pieces = self.split_text(text, max_text_tokens_per_segment)
         ref_audio = None
         aligned_ref_text = ""
         if mode == "clone":
             if progress_callback:
-                progress_callback(0, len(pieces), "正在对齐 Fish S2 Pro 参考音频与原文")
+                progress_callback(0, len(planned_pieces), "正在对齐 Fish S2 Pro 参考音频与原文")
             ref_audio, aligned_ref_text = self._prepare_reference(
                 str(reference_audio), str(ref_text or ""), float(ref_audio_max_duration_s)
             )
 
-        generated: list[np.ndarray] = []
-        for index, piece in enumerate(pieces, start=1):
-            while pause_requested and pause_requested():
-                if cancel_requested and cancel_requested():
-                    raise GenerationCancelled("用户已终止当前任务")
-                time.sleep(0.1)
+        while pause_requested and pause_requested():
             if cancel_requested and cancel_requested():
                 raise GenerationCancelled("用户已终止当前任务")
-            if progress_callback:
-                progress_callback(index - 1, len(pieces), f"Fish S2 Pro 片段 {index}/{len(pieces)}")
+            time.sleep(0.1)
+        if cancel_requested and cancel_requested():
+            raise GenerationCancelled("用户已终止当前任务")
 
-            mx.random.seed(int(seed) + index - 1)
-            results = list(
-                self.runtime.generate(
-                    text=piece,
-                    ref_audio=ref_audio,
-                    ref_text=aligned_ref_text or None,
-                    instruct=str(instruct or "").strip() or None,
-                    temperature=float(temperature),
-                    top_p=float(top_p),
-                    top_k=int(top_k),
-                    max_tokens=int(max_tokens),
-                    speed=float(speed),
-                    chunk_length=int(chunk_length),
-                    stream=False,
-                    verbose=False,
+        # Fish's own chunker preserves the running conversation context. Calling
+        # the runtime once per WebUI planning segment resets that context and
+        # creates audible stop/start boundaries, so pass the whole batch once.
+        token_limit = max(self.MIN_AUDIO_TOKENS, int(max_tokens))
+        token_limit = min(self.MAX_AUDIO_TOKENS, token_limit)
+        while True:
+            if progress_callback:
+                progress_callback(
+                    0,
+                    len(planned_pieces),
+                    f"Fish S2 Pro 正在连续生成（音频 Token 上限 {token_limit}）",
                 )
+            mx.random.seed(int(seed))
+            result_stream = self.runtime.generate(
+                text=text,
+                ref_audio=ref_audio,
+                ref_text=aligned_ref_text or None,
+                instruct=str(instruct or "").strip() or None,
+                temperature=float(temperature),
+                top_p=float(top_p),
+                top_k=int(top_k),
+                max_tokens=token_limit,
+                speed=float(speed),
+                chunk_length=int(chunk_length),
+                stream=False,
+                verbose=False,
             )
+            results = []
+            for result in result_stream:
+                if cancel_requested and cancel_requested():
+                    raise GenerationCancelled("用户已终止当前任务")
+                results.append(result)
+                if progress_callback:
+                    progress_callback(
+                        min(len(results), len(planned_pieces)),
+                        len(planned_pieces),
+                        f"Fish S2 Pro 已生成 {len(results)} 个连续片段",
+                    )
             if not results:
                 raise RuntimeError("Fish S2 Pro 未返回音频。")
-            for result in results:
-                audio = np.asarray(result.audio, dtype=np.float32).squeeze()
-                audio = np.clip(audio, -1.0, 1.0)
-                generated.append(audio)
-                if audio_chunk_callback:
-                    audio_chunk_callback(audio, self.sample_rate)
+            capped = any(int(getattr(result, "token_count", 0)) >= token_limit for result in results)
+            if not capped:
+                break
+            if token_limit >= self.MAX_AUDIO_TOKENS:
+                raise RuntimeError(
+                    "Fish S2 Pro 音频达到 4096 Token 安全上限，已停止保存，"
+                    "避免生成被硬截断的残缺音频。请缩短单段文案或增加标点。"
+                )
+            token_limit = min(self.MAX_AUDIO_TOKENS, token_limit * 2)
+
+        generated: list[np.ndarray] = []
+        total_results = len(results)
+        for index, result in enumerate(results, start=1):
+            audio = np.asarray(result.audio, dtype=np.float32).squeeze()
+            audio = np.clip(audio, -1.0, 1.0)
+            generated.append(audio)
+            if audio_chunk_callback:
+                audio_chunk_callback(audio, self.sample_rate)
             if progress_callback:
-                progress_callback(index, len(pieces), f"Fish S2 Pro 片段 {index}/{len(pieces)} 已完成")
+                progress_callback(
+                    min(index, len(planned_pieces)),
+                    len(planned_pieces),
+                    f"Fish S2 Pro 连续片段 {index}/{total_results} 已完成",
+                )
 
         joined = self._join_audio(generated, int(interval_silence), self.sample_rate)
         target = Path(output_path)
