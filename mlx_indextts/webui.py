@@ -46,6 +46,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODEL_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2.5-int8"
 MODEL_V2_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2"
 OMNIVOICE_MODEL_DIR = PROJECT_ROOT / "models" / "OmniVoice-bfloat16"
+OMNIVOICE_ASR_MODEL_DIR = PROJECT_ROOT / "models" / "Qwen3-ASR-0.6B-8bit"
 DEFAULT_SPEAKER = PROJECT_ROOT / "outputs" / "voice_01_speaker.npz"
 DEFAULT_VOICE_PREVIEW = PROJECT_ROOT / "outputs" / "voice_01_preview.wav"
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "webui"
@@ -1154,7 +1155,10 @@ def get_omnivoice_model() -> OmniVoiceTTS:
                 _release_loaded_model_unlocked()
                 if not OMNIVOICE_MODEL_DIR.exists():
                     raise RuntimeError(f"找不到 OmniVoice 模型目录：{OMNIVOICE_MODEL_DIR}")
-                _model = OmniVoiceTTS(str(OMNIVOICE_MODEL_DIR))
+                _model = OmniVoiceTTS(
+                    str(OMNIVOICE_MODEL_DIR),
+                    asr_model_dir=str(OMNIVOICE_ASR_MODEL_DIR),
+                )
                 _model_backend = "omnivoice"
     assert isinstance(_model, OmniVoiceTTS)
     return _model
@@ -2350,7 +2354,6 @@ def save_omnivoice_settings(
     update_user_config(
         omnivoice_mode=str(mode),
         omnivoice_language=str(language or "None"),
-        omnivoice_ref_text=str(ref_text or ""),
         omnivoice_instruct=str(instruct or ""),
         omnivoice_duration_s=max(0.0, float(duration_s)),
         omnivoice_num_steps=int(num_steps),
@@ -2365,7 +2368,16 @@ def save_omnivoice_settings(
 
 def load_omnivoice_settings() -> tuple:
     config = read_user_config()
-    return tuple(config[key] for key in DEFAULT_OMNIVOICE_SETTINGS)
+    entry = _load_voice_entry(config.get("voice_library_id"))
+    values = dict(config)
+    values["omnivoice_ref_text"] = str(entry.get("omnivoice_ref_text") or "") if entry else ""
+    return tuple(values[key] for key in DEFAULT_OMNIVOICE_SETTINGS)
+
+
+def load_voice_omnivoice_transcript(voice_id: str | None) -> str:
+    """Keep the alignment transcript attached to its matching voice."""
+    entry = _load_voice_entry(voice_id)
+    return str(entry.get("omnivoice_ref_text") or "") if entry else ""
 
 
 def update_model_controls(model_backend: str) -> tuple:
@@ -3077,9 +3089,9 @@ def _synthesize_unlocked(
         )
         use_v25_backend = model_backend == "IndexTTS 2.5"
         if model_backend == "OmniVoice":
-            reference = optimized_path if library_entry and omnivoice_mode == "clone" else None
-            if reference is not None and not reference.exists():
-                reference = Path(reference_audio)
+            # OmniVoice performs its own exact 24 kHz preprocessing. Feeding the
+            # normalized 22.05 kHz IndexTTS preview here loses speaker detail.
+            reference = Path(reference_audio) if library_entry and omnivoice_mode == "clone" else None
         else:
             assert library_entry is not None and conditioning_key is not None
             conditioning_path = Path(str(library_entry[conditioning_key]))
@@ -3155,7 +3167,10 @@ def _synthesize_unlocked(
             omnivoice_t_shift,
             omnivoice_ref_audio_max_duration_s,
         )
-        model.cache = {}
+        if model_backend != "OmniVoice":
+            # IndexTTS caches are keyed by per-voice conditioning files. Keep the
+            # OmniVoice prompt cache so reference encoding/ASR runs only once.
+            model.cache = {}
         requested_max_text_tokens = int(max_text_tokens)
         effective_max_text_tokens = requested_max_text_tokens
         prepared_batches = _prepare_model_batches(
@@ -3242,7 +3257,10 @@ def _synthesize_unlocked(
                 generate_kwargs.update(
                     omnivoice_mode=omnivoice_mode,
                     language=omnivoice_language,
-                    ref_text=omnivoice_ref_text,
+                    ref_text=(
+                        omnivoice_ref_text
+                        or (str(library_entry.get("omnivoice_ref_text") or "") if library_entry else "")
+                    ),
                     instruct=omnivoice_instruct,
                     duration_s=float(omnivoice_duration_s),
                     num_steps=int(omnivoice_num_steps),
@@ -3254,6 +3272,18 @@ def _synthesize_unlocked(
                     ref_audio_max_duration_s=float(omnivoice_ref_audio_max_duration_s),
                 )
             generated_audio = model.generate(**generate_kwargs)
+            if (
+                model_backend == "OmniVoice"
+                and omnivoice_mode == "clone"
+                and library_entry
+                and getattr(model, "last_reference_transcript", "")
+                and str(library_entry.get("omnivoice_ref_text") or "")
+                != str(model.last_reference_transcript)
+            ):
+                library_entry = _update_voice_metadata(
+                    str(library_entry["id"]),
+                    omnivoice_ref_text=str(model.last_reference_transcript),
+                ) or library_entry
             job_sample_rate = int(getattr(model, "sample_rate", VOICE_SAMPLE_RATE))
             quality_report = _analyze_backend_audio(generated_audio, job_sample_rate, model_backend)
             quality_reports.append(quality_report)
@@ -3801,6 +3831,9 @@ def synthesize_stream(
 
 def build_ui() -> gr.Blocks:
     initial_config = read_user_config()
+    initial_omnivoice_ref_text = load_voice_omnivoice_transcript(
+        initial_config.get("voice_library_id")
+    )
     with gr.Blocks(title="IndexTTS 2.5 专业语音工作台") as demo:
         document_state = gr.State(value=None)
         document_queue_state = gr.State(value=[])
@@ -4266,8 +4299,8 @@ def build_ui() -> gr.Blocks:
                                 allow_custom_value=True,
                             )
                             omnivoice_ref_text = gr.Textbox(
-                                label="参考音频原文（克隆模式强烈建议）",
-                                value=initial_config["omnivoice_ref_text"],
+                                label="参考音频原文（留空将自动识别并按音色缓存）",
+                                value=initial_omnivoice_ref_text,
                                 lines=2,
                             )
                             omnivoice_instruct = gr.Textbox(
@@ -4498,11 +4531,17 @@ def build_ui() -> gr.Blocks:
             ],
             queue=False,
         )
+        voice_library_selector.change(
+            fn=load_voice_omnivoice_transcript,
+            inputs=[voice_library_selector],
+            outputs=[omnivoice_ref_text],
+            queue=False,
+        )
 
         for quick_button, quick_remove_button, quick_state in zip(
             quick_voice_buttons, quick_voice_remove_buttons, quick_voice_states
         ):
-            quick_button.click(
+            quick_select_event = quick_button.click(
                 fn=select_quick_voice,
                 inputs=[quick_state],
                 outputs=[
@@ -4513,6 +4552,12 @@ def build_ui() -> gr.Blocks:
                     library_voice_preview,
                     status,
                 ],
+                queue=False,
+            )
+            quick_select_event.then(
+                fn=load_voice_omnivoice_transcript,
+                inputs=[voice_library_selector],
+                outputs=[omnivoice_ref_text],
                 queue=False,
             )
             remove_favorite_event = quick_remove_button.click(
@@ -4605,6 +4650,12 @@ def build_ui() -> gr.Blocks:
                     *quick_voice_remove_buttons,
                     *quick_voice_states,
                 ],
+                queue=False,
+            )
+            reference_audio_event.then(
+                fn=load_voice_omnivoice_transcript,
+                inputs=[voice_library_selector],
+                outputs=[omnivoice_ref_text],
                 queue=False,
             )
 

@@ -12,7 +12,14 @@ design and automatic voices, and is loaded only when selected.
 uv add mlx-audio==0.4.4
 uv run hf download mlx-community/OmniVoice-bfloat16 \
   --local-dir models/OmniVoice-bfloat16
+uv run hf download mlx-community/Qwen3-ASR-0.6B-8bit \
+  --local-dir models/Qwen3-ASR-0.6B-8bit
 ```
+
+For stable cloning, OmniVoice must align the reference audio with its exact
+transcript. When the transcript field is empty, the WebUI preprocesses the
+reference prompt, transcribes that exact audio locally with Qwen3-ASR, and
+caches the result with the selected voice.
 
 OmniVoice model weights are licensed CC-BY-NC (non-commercial use). This is
 the k2-fsa OmniVoice project, not Xiaomi's official MiMo TTS.
