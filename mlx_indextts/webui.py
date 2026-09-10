@@ -43,6 +43,7 @@ from mlx_indextts.power_monitor import start_macos_power_monitor
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+APP_VERSION = "0.2.1"
 MODEL_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2.5-int8"
 MODEL_V2_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2"
 OMNIVOICE_MODEL_DIR = PROJECT_ROOT / "models" / "OmniVoice-bfloat16"
@@ -839,6 +840,26 @@ body, .gradio-container {
 .about-table th { background: #f4f7fb; color: #263d5b; font-weight: 750; }
 .version-installed { color: #137333; font-weight: 760; }
 .version-absent { color: #a44b00; font-weight: 760; }
+.about-changelog-title {
+  margin: 18px 0 9px;
+  color: #203a5d;
+  font-size: 17px;
+  font-weight: 780;
+}
+.about-release {
+  margin-top: 9px;
+  padding: 11px 13px;
+  border: 1px solid #dce4ee;
+  border-radius: 9px;
+  background: #fbfcfe;
+  color: #33465f;
+  font-size: 14px;
+  line-height: 1.55;
+}
+.about-release-head { margin-bottom: 5px; color: #173f70; }
+.about-release-head strong { margin-right: 7px; font-size: 15px; }
+.about-release ul { margin: 5px 0 0 19px; padding: 0; }
+.about-release li { margin: 3px 0; }
 .about-note { margin: 13px 0 0; color: #5d6b7d; font-size: 13px; line-height: 1.55; }
 
 .result-panel { min-height: 105px !important; gap: 7px !important; }
@@ -3834,7 +3855,7 @@ def build_ui() -> gr.Blocks:
     initial_omnivoice_ref_text = load_voice_omnivoice_transcript(
         initial_config.get("voice_library_id")
     )
-    with gr.Blocks(title="IndexTTS 2.5 专业语音工作台") as demo:
+    with gr.Blocks(title=f"IndexTTS 2.5 专业语音工作台 · v{APP_VERSION}") as demo:
         document_state = gr.State(value=None)
         document_queue_state = gr.State(value=[])
         with gr.Sidebar(
@@ -3963,19 +3984,19 @@ def build_ui() -> gr.Blocks:
                 <span class="app-badge">Apple MLX</span>
                 <span class="app-badge">离线可用</span>
                 <span class="app-badge">22.05 kHz</span>
-                <button id="about-open" class="about-trigger" type="button">关于 / 版本</button>
+                <button id="about-open" class="about-trigger" type="button">关于 / v0.2.1</button>
               </div>
             </header>
 
             <div id="about-modal" class="about-modal" aria-hidden="true">
               <section class="about-card" role="dialog" aria-modal="true" aria-labelledby="about-title">
                 <div class="about-card-head">
-                  <h2 id="about-title">IndexTTS 2.5 关于与版本信息</h2>
+                  <h2 id="about-title">IndexTTS WebUI · v0.2.1</h2>
                   <button id="about-close" class="about-close" type="button" aria-label="关闭">×</button>
                 </div>
                 <div class="about-card-body">
                   <div class="about-current">
-                    <strong>当前本机主模型：IndexTTS 2.5</strong><br>
+                    <strong>当前应用版本：v0.2.1</strong><br>
                     默认使用 IndexTTS 2.5，可切换 IndexTTS 2.0 与本地 OmniVoice MLX。
                     三个大模型按需分时加载，避免同时占用统一内存。
                   </div>
@@ -3991,9 +4012,28 @@ def build_ui() -> gr.Blocks:
                       <tr><td>MLX 推理引擎</td><td>0.31.1</td><td>运行于 Apple Silicon 统一内存和 GPU。</td></tr>
                       <tr><td>PyTorch</td><td>2.10.0（仅旧 2.0 回退）</td><td>2.5 主路径为 Torch-free MLX，不调用 PyTorch。</td></tr>
                       <tr><td>文档导入 / OCR</td><td>Calibre 9.13.0 / Tesseract 5</td><td>本机读取 TXT、MD、DOC、DOCX、PDF、EPUB、MOBI；扫描 PDF 使用本机中文 OCR。</td></tr>
-                      <tr><td>WebUI</td><td>mlx-indextts 0.1.0 + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持队列、长文分段、暂停、终止与音质检查。</td></tr>
+                      <tr><td>WebUI</td><td><strong>mlx-indextts 0.2.1</strong> + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持队列、长文分段、暂停、终止、实时试听与音质检查。</td></tr>
                     </tbody>
                   </table>
+                  <div class="about-changelog-title">版本变更日志</div>
+                  <section class="about-release">
+                    <div class="about-release-head"><strong>v0.2.1</strong><span>2026-09-10 · OmniVoice 克隆质量修复</span></div>
+                    <ul>
+                      <li>克隆改用原始参考音频，避免二次处理造成声纹细节损失。</li>
+                      <li>新增本地 Qwen3-ASR，自动转写预处理后的参考音频，完成声音与文本对齐。</li>
+                      <li>对齐原文按音色独立缓存；mlx-audio 升级至 0.4.6。</li>
+                      <li>明确区分“克隆已选音色”、“音色设计”和“自动音色”。</li>
+                    </ul>
+                  </section>
+                  <section class="about-release">
+                    <div class="about-release-head"><strong>v0.2.0</strong><span>2026-09-10 · OmniVoice 首次接入</span></div>
+                    <ul>
+                      <li>新增 IndexTTS 2.5、IndexTTS 2.0、OmniVoice 三模型显式切换。</li>
+                      <li>接入本地 OmniVoice bfloat16 权重及音色克隆、设计、自动三种模式。</li>
+                      <li>开放语言、扩散步数、引导强度、温度、T-Shift 等参数。</li>
+                      <li>实现大模型按需加载和 OmniVoice 24 kHz 音质检查。</li>
+                    </ul>
+                  </section>
                   <p class="about-note">版本判定以本机实际加载的配置和权重为准，而不是以页面名称为准。更换主模型后，还需同步检查 GPT、S2Mel、声码器和音色缓存格式的兼容性。</p>
                 </div>
               </section>

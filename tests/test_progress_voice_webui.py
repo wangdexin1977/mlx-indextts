@@ -727,6 +727,17 @@ def test_emotion_backend_dispatch_preserves_follow_and_named_modes(monkeypatch):
     )
 
 
+def test_about_panel_and_changelog_track_current_release():
+    source = inspect.getsource(webui.build_ui)
+    changelog = (webui.PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+
+    assert webui.APP_VERSION == "0.2.1"
+    assert "关于 / v0.2.1" in source
+    assert "版本变更日志" in source
+    assert "v0.2.1" in changelog
+    assert "v0.2.0" in changelog
+
+
 def test_page_restore_keeps_conditioning_for_identical_temporary_copy(tmp_path: Path, monkeypatch):
     voice_dir = tmp_path / "voices"
     voice_dir.mkdir()

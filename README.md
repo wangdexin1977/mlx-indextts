@@ -2,6 +2,10 @@
 
 IndexTTS for Apple Silicon using MLX. Zero-shot text-to-speech with voice cloning capabilities.
 
+Current WebUI release: **v0.2.1**. See [CHANGELOG.md](CHANGELOG.md) for the
+version history; every release must update both that file and the in-app
+"About / Version" panel.
+
 ## WebUI model switching
 
 The WebUI can switch between IndexTTS 2.5, IndexTTS 2.0 and the local MLX
