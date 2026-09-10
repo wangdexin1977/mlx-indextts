@@ -264,6 +264,22 @@ def test_invalid_saved_output_format_falls_back_to_wav(tmp_path: Path, monkeypat
     assert webui.read_user_config()["output_format"] == "wav"
 
 
+def test_default_audio_filename_uses_first_fifteen_copy_characters():
+    text = "  第一行 文案\n第二行继续，这是额外内容"
+
+    assert webui._default_audio_filename_stem(text) == "第一行文案第二行继续，这是额外"
+    assert webui._default_audio_filename_stem('标题/含:非法*字符?但可生成') == "标题_含_非法_字符_但可生成"
+    assert webui._default_audio_filename_stem(" \n\t ") == "未命名音频"
+
+
+def test_default_audio_filename_adds_sequence_instead_of_overwriting(tmp_path: Path):
+    text = "这是一个超过十五个字的测试文案内容"
+    stem = "这是一个超过十五个字的测试文案"
+    (tmp_path / f"{stem}.mp3").write_bytes(b"existing")
+
+    assert webui._available_audio_basename(tmp_path, text, "mp3") == f"{stem}_2"
+
+
 def test_progress_emphasises_percentage_and_elapsed_time():
     rendered = webui.render_generation_progress()
 
@@ -671,7 +687,7 @@ def test_follow_synthesis_uses_selector_voice_and_never_legacy_conditioning(
     fake_model = FakeModel()
     monkeypatch.setattr(webui, "get_model", lambda: fake_model)
 
-    webui.synthesize(
+    generated_path, _status, _location = webui.synthesize(
         "测试文字",
         selected_entry["id"],
         "IndexTTS 2.5",
@@ -696,6 +712,7 @@ def test_follow_synthesis_uses_selector_voice_and_never_legacy_conditioning(
         progress=lambda *_args, **_kwargs: None,
     )
 
+    assert Path(generated_path).name == "测试文字.wav"
     assert conditioning_calls[0][0] == Path(selected_entry["source_path"])
     assert conditioning_calls[0][1]["conditioning_path"] == expected_conditioning
     assert fake_model.reference_used == str(expected_conditioning)
@@ -731,9 +748,10 @@ def test_about_panel_and_changelog_track_current_release():
     source = inspect.getsource(webui.build_ui)
     changelog = (webui.PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert webui.APP_VERSION == "0.3.0"
-    assert "关于 / v0.3.0" in source
+    assert webui.APP_VERSION == "0.3.1"
+    assert "关于 / v0.3.1" in source
     assert "版本变更日志" in source
+    assert "v0.3.1" in changelog
     assert "v0.3.0" in changelog
     assert "v0.2.1" in changelog
     assert "v0.2.0" in changelog

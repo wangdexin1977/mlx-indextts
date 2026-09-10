@@ -44,7 +44,7 @@ from mlx_indextts.power_monitor import start_macos_power_monitor
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 MODEL_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2.5-int8"
 MODEL_V2_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2"
 OMNIVOICE_MODEL_DIR = PROJECT_ROOT / "models" / "OmniVoice-bfloat16"
@@ -1300,6 +1300,32 @@ def _resolve_output_directory(value: str | None, *, create: bool = True) -> Path
     if not os.access(output_directory, os.W_OK):
         raise PermissionError(f"输出文件夹不可写：{output_directory}")
     return output_directory
+
+
+def _default_audio_filename_stem(text: str, limit: int = 15) -> str:
+    """Build a readable, filesystem-safe stem from the opening copy."""
+    compact = re.sub(r"\s+", "", str(text or ""))
+    opening = compact[:limit]
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", opening).strip(" ._")
+    return safe or "未命名音频"
+
+
+def _available_audio_basename(directory: Path, text: str, output_format: str) -> str:
+    """Avoid overwriting an earlier result with the same opening copy."""
+    stem = _default_audio_filename_stem(text)
+    candidate = stem
+    sequence = 2
+    while True:
+        conflicts = (
+            directory / f"{candidate}.{output_format}",
+            directory / f"{candidate}.wav",
+            directory / f"{candidate}.partial.wav",
+            directory / f".{candidate}.parts",
+        )
+        if not any(path.exists() for path in conflicts):
+            return candidate
+        candidate = f"{stem}_{sequence}"
+        sequence += 1
 
 
 def _convert_output_audio(source_wav: Path, target_path: Path, output_format: str) -> None:
@@ -3159,7 +3185,7 @@ def _synthesize_unlocked(
         selected_directory = _resolve_output_directory(output_directory)
     except (OSError, ValueError) as exc:
         raise gr.Error(f"输出地址不可用：{exc}") from exc
-    basename = f"tts_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    basename = _available_audio_basename(selected_directory, cleaned_text, selected_format)
     final_path = selected_directory / f"{basename}.{selected_format}"
     output_path = final_path if selected_format == "wav" else selected_directory / f"{basename}.wav"
     update_user_config(
@@ -3563,32 +3589,6 @@ def synthesize(*args, **kwargs) -> tuple[str | None, str, str]:
         _synthesis_job_lock.release()
 
 
-def _safe_queue_output_name(title: str, fallback: str = "document") -> str:
-    cleaned = re.sub(r"[^0-9A-Za-z\u3400-\u9fff._-]+", "_", str(title or "")).strip("._-")
-    return (cleaned or fallback)[:80]
-
-
-def _rename_queue_output(
-    generated_path: str | None,
-    output_directory: str,
-    queue_index: int,
-    title: str,
-    run_id: str,
-) -> str | None:
-    if not generated_path:
-        return None
-    source = Path(generated_path)
-    if not source.exists():
-        return generated_path
-    directory = _resolve_output_directory(output_directory)
-    stem = _safe_queue_output_name(title, f"document_{queue_index:02d}")
-    target = directory / f"{queue_index:02d}_{stem}_{run_id}{source.suffix.lower()}"
-    if target.exists():
-        target = directory / f"{queue_index:02d}_{stem}_{run_id}_{uuid.uuid4().hex[:4]}{source.suffix.lower()}"
-    source.replace(target)
-    return str(target)
-
-
 def _write_document_queue_manifest(
     queue_data: list[dict],
     output_directory: str,
@@ -3783,12 +3783,11 @@ def synthesize_document_queue_stream(
                         location=location,
                     )
                     break
-                renamed = _rename_queue_output(audio_path, output_directory, index, str(item["title"]), run_id)
-                item.update(status="completed", output=renamed or location or "", error="")
+                item.update(status="completed", output=audio_path or location or "", error="")
                 publish(
                     f"队列 {index}/{len(queue)}｜已完成：{item['title']}｜{item_status}",
-                    audio=renamed or audio_path,
-                    location=renamed or location,
+                    audio=audio_path,
+                    location=audio_path or location,
                 )
                 _write_document_queue_manifest(queue, output_directory, run_id, "running")
 
@@ -4153,19 +4152,19 @@ def build_ui() -> gr.Blocks:
                 <span class="app-badge">Apple MLX</span>
                 <span class="app-badge">离线可用</span>
                 <span class="app-badge">22.05 kHz</span>
-                <button id="about-open" class="about-trigger" type="button">关于 / v0.3.0</button>
+                <button id="about-open" class="about-trigger" type="button">关于 / v0.3.1</button>
               </div>
             </header>
 
             <div id="about-modal" class="about-modal" aria-hidden="true">
               <section class="about-card" role="dialog" aria-modal="true" aria-labelledby="about-title">
                 <div class="about-card-head">
-                  <h2 id="about-title">IndexTTS WebUI · v0.3.0</h2>
+                  <h2 id="about-title">IndexTTS WebUI · v0.3.1</h2>
                   <button id="about-close" class="about-close" type="button" aria-label="关闭">×</button>
                 </div>
                 <div class="about-card-body">
                   <div class="about-current">
-                    <strong>当前应用版本：v0.3.0</strong><br>
+                    <strong>当前应用版本：v0.3.1</strong><br>
                     默认使用 IndexTTS 2.5，可切换 IndexTTS 2.0、OmniVoice 与 Fish Audio S2 Pro。
                     四个大模型按需分时加载，避免同时占用统一内存。
                   </div>
@@ -4182,10 +4181,18 @@ def build_ui() -> gr.Blocks:
                       <tr><td>MLX 推理引擎</td><td>0.31.1</td><td>运行于 Apple Silicon 统一内存和 GPU。</td></tr>
                       <tr><td>PyTorch</td><td>2.10.0（仅旧 2.0 回退）</td><td>2.5 主路径为 Torch-free MLX，不调用 PyTorch。</td></tr>
                       <tr><td>文档导入 / OCR</td><td>Calibre 9.13.0 / Tesseract 5</td><td>本机读取 TXT、MD、DOC、DOCX、PDF、EPUB、MOBI；扫描 PDF 使用本机中文 OCR。</td></tr>
-                      <tr><td>WebUI</td><td><strong>mlx-indextts 0.3.0</strong> + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持四模型切换、独立参数、队列、长文分段、暂停、终止、实时试听与音质检查。</td></tr>
+                      <tr><td>WebUI</td><td><strong>mlx-indextts 0.3.1</strong> + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持四模型切换、独立参数、队列、长文分段、暂停、终止、实时试听与音质检查。</td></tr>
                     </tbody>
                   </table>
                   <div class="about-changelog-title">版本变更日志</div>
+                  <section class="about-release">
+                    <div class="about-release-head"><strong>v0.3.1</strong><span>2026-09-10 · 音频按文案开头命名</span></div>
+                    <ul>
+                      <li>生成文件默认采用文案开头前 15 个非空白字符作为文件名。</li>
+                      <li>自动处理文件名非法字符；遇到同名文件时追加序号，避免覆盖已有音频。</li>
+                      <li>单次合成和多文档队列遵循同一命名规则。</li>
+                    </ul>
+                  </section>
                   <section class="about-release">
                     <div class="about-release-head"><strong>v0.3.0</strong><span>2026-09-10 · Fish Audio S2 Pro 接入</span></div>
                     <ul>
