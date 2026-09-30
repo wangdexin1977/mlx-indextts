@@ -6,6 +6,13 @@ import numpy as np
 from mlx_indextts.generate_omnivoice import OmniVoiceTTS
 
 
+def test_segment_limit_does_not_leave_a_quote_only_inference():
+    text = '“' + '正文' * 14 + '。”'
+    pieces = OmniVoiceTTS.split_text(text, 30)
+    assert pieces == [text]
+    assert OmniVoiceTTS.split_text('”\n。！？', 30) == []
+
+
 def test_mlx_clone_keeps_expression_instruct(monkeypatch, tmp_path):
     calls = []
 

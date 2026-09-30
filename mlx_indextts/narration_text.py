@@ -17,7 +17,8 @@ _NUMERIC_REFERENCE = re.compile(
 )
 _MARKDOWN_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
 _MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
-_SENTENCE_BOUNDARY = re.compile(r"(?<=[。！？!?；;])\s*|\n+")
+# Include closing quotes, even when ebook formatting puts them on a new line.
+_SENTENCE_BOUNDARY = re.compile(r"[。！？!?；;]+(?:\s*[\"'”’」』）)\]】》])*|\n+")
 
 
 def _remove_symbol_emoji(value: str) -> str:
@@ -64,11 +65,37 @@ def split_narration_units(text: str | None, mode: str = "paragraph") -> list[str
     if not value:
         return []
     if mode == "sentence":
-        return [part.strip() for part in _SENTENCE_BOUNDARY.split(value) if part.strip()]
-    if mode == "line":
-        return [part.strip() for part in value.splitlines() if part.strip()]
-    paragraphs = [part.strip() for part in re.split(r"\n\s*\n+", value) if part.strip()]
-    return paragraphs or [value]
+        parts = []
+        start = 0
+        for boundary in _SENTENCE_BOUNDARY.finditer(value):
+            parts.append(value[start:boundary.end()])
+            start = boundary.end()
+        parts.append(value[start:])
+    elif mode == "line":
+        parts = value.splitlines()
+    else:
+        parts = re.split(r"\n\s*\n+", value)
+
+    return attach_narration_punctuation(parts)
+
+
+def attach_narration_punctuation(parts: list[str]) -> list[str]:
+    """Keep punctuation with spoken text instead of requesting silent audio."""
+    units: list[str] = []
+    leading_punctuation = ""
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if not any(character.isalnum() for character in part):
+            if units:
+                units[-1] += part
+            else:
+                leading_punctuation += part
+            continue
+        units.append(leading_punctuation + part)
+        leading_punctuation = ""
+    return units
 
 
 def assign_voices_to_units(
@@ -83,3 +110,17 @@ def assign_voices_to_units(
         (unit, voices[(index // interval) % len(voices)])
         for index, unit in enumerate(units)
     ]
+
+
+def group_voice_runs(
+    assignments: list[tuple[str, str]], separator: str = "\n"
+) -> list[tuple[str, str, int]]:
+    """Synthesize adjacent units assigned to the same voice together."""
+    runs: list[tuple[str, str, int]] = []
+    for text, voice_id in assignments:
+        if runs and runs[-1][1] == voice_id:
+            previous, _, count = runs[-1]
+            runs[-1] = (previous + separator + text, voice_id, count + 1)
+        else:
+            runs.append((text, voice_id, 1))
+    return runs

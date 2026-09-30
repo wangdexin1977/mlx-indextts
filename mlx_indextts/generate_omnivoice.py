@@ -14,6 +14,7 @@ import numpy as np
 import soundfile as sf
 
 from mlx_indextts.generate_v2 import GenerationCancelled
+from mlx_indextts.narration_text import attach_narration_punctuation
 
 
 SAMPLE_RATE = 24_000
@@ -249,7 +250,7 @@ class OmniVoiceTTS:
                 current += unit
         if current.strip():
             pieces.append(current.strip())
-        return [piece for piece in pieces if piece]
+        return attach_narration_punctuation(pieces)
 
     @staticmethod
     def _estimated_duration(text: str, speed: float) -> float:

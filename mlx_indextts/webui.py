@@ -49,12 +49,13 @@ from mlx_indextts.power_monitor import start_macos_power_monitor
 from mlx_indextts.narration_text import (
     assign_voices_to_units,
     clean_narration_text,
+    group_voice_runs,
     split_narration_units,
 )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.5.8"
+APP_VERSION = "0.5.9"
 MODEL_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2.5-int8"
 MODEL_V2_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2"
 OMNIVOICE_MODEL_DIR = PROJECT_ROOT / "models" / "OmniVoice-bfloat16"
@@ -4312,6 +4313,7 @@ def synthesize_multi_voice(
     assignments = assign_voices_to_units(units, selected_voices, int(switch_every or 1))
     if not assignments:
         raise gr.Error("没有识别到可朗读的段落或句子。")
+    runs = group_voice_runs(assignments, "\n\n" if split_mode == "paragraph" else "\n")
 
     selected_format = _normalise_output_format(str(synthesis_kwargs.get("output_format") or "mp3"))
     selected_directory = _resolve_output_directory(str(synthesis_kwargs.get("output_directory") or OUTPUT_DIR))
@@ -4320,6 +4322,7 @@ def synthesize_multi_voice(
     merged_wav = final_path if selected_format == "wav" else selected_directory / f"{basename}.wav"
     temporary_directory = Path(tempfile.mkdtemp(prefix=".multi_voice_", dir=selected_directory))
     generated_parts: list[Path] = []
+    completed_units = 0
     original_config = read_user_config()
     cancelled = False
     completed_delivery = False
@@ -4328,7 +4331,7 @@ def synthesize_multi_voice(
         raise gr.Error("已有音频合成任务正在后台运行，请先等待或终止当前任务。")
     sleep_prevention = _start_sleep_prevention() if not job_lock_held else None
     try:
-        for index, (unit, voice_id) in enumerate(assignments, start=1):
+        for unit, voice_id, unit_count in runs:
             if job_lock_held and _document_queue_cancelled.is_set():
                 cancelled = True
                 break
@@ -4337,10 +4340,10 @@ def synthesize_multi_voice(
             with _generation_progress_lock:
                 _generation_progress_state.update(
                     state="running",
-                    current=index - 1,
+                    current=completed_units,
                     total=len(assignments),
                     message=(
-                        f"多人朗读 {index}/{len(assignments)}｜"
+                        f"多人朗读 {completed_units + 1}–{completed_units + unit_count}/{len(assignments)}｜"
                         f"正在使用音色：{entry.get('name') or voice_id[:8]}"
                     ),
                 )
@@ -4362,6 +4365,8 @@ def synthesize_multi_voice(
             part_path, part_status, _location = _synthesize_unlocked(**part_kwargs)
             if part_path and Path(part_path).is_file():
                 generated_parts.append(Path(part_path))
+                if not str(part_status).startswith("任务已终止"):
+                    completed_units += unit_count
                 if batch_ready_callback is not None:
                     batch_ready_callback(str(part_path))
             if str(part_status).startswith("任务已终止"):
@@ -4370,9 +4375,9 @@ def synthesize_multi_voice(
             with _generation_progress_lock:
                 _generation_progress_state.update(
                     state="running",
-                    current=index,
+                    current=completed_units,
                     total=len(assignments),
-                    message=f"多人朗读已完成 {index}/{len(assignments)} 个单元",
+                    message=f"多人朗读已完成 {completed_units}/{len(assignments)} 个单元",
                 )
 
         if not generated_parts:
@@ -4391,7 +4396,7 @@ def synthesize_multi_voice(
         ]
         if cancelled:
             status = (
-                f"多人朗读已安全终止｜已合并 {len(generated_parts)}/{len(assignments)} 个单元｜"
+                f"多人朗读已安全终止｜已完成 {completed_units}/{len(assignments)} 个单元｜"
                 f"格式 {selected_format.upper()}｜已保存至 {final_path}"
             )
             state = "cancelled"
@@ -4405,7 +4410,7 @@ def synthesize_multi_voice(
         with _generation_progress_lock:
             _generation_progress_state.update(
                 state=state,
-                current=len(generated_parts),
+                current=completed_units,
                 total=len(assignments),
                 message=status,
                 finished_elapsed=_active_elapsed(_generation_progress_state),
@@ -5064,19 +5069,19 @@ def build_ui() -> gr.Blocks:
                 <span class="app-badge">Apple MLX</span>
                 <span class="app-badge">离线可用</span>
                 <span class="app-badge">OmniVoice 24 kHz</span>
-                <button id="about-open" class="about-trigger" type="button">关于 / v0.5.8</button>
+                <button id="about-open" class="about-trigger" type="button">关于 / v0.5.9</button>
               </div>
             </header>
 
             <div id="about-modal" class="about-modal" aria-hidden="true">
               <section class="about-card" role="dialog" aria-modal="true" aria-labelledby="about-title">
                 <div class="about-card-head">
-                  <h2 id="about-title">IndexTTS WebUI · v0.5.8</h2>
+                  <h2 id="about-title">IndexTTS WebUI · v0.5.9</h2>
                   <button id="about-close" class="about-close" type="button" aria-label="关闭">×</button>
                 </div>
                 <div class="about-card-body">
                   <div class="about-current">
-                    <strong>当前应用版本：v0.5.8（2026-09-30，夜间文案文本清洗与撤销）</strong><br>
+                    <strong>当前应用版本：v0.5.9（2026-09-30，多音色分句静音修复）</strong><br>
                     默认使用 OmniVoice、默认输出 MP3；六个引擎按需分时加载，避免同时占用统一内存。
                   </div>
                   <table class="about-table">
@@ -5094,10 +5099,17 @@ def build_ui() -> gr.Blocks:
                       <tr><td>MLX 推理引擎</td><td>0.31.1</td><td>运行于 Apple Silicon 统一内存和 GPU。</td></tr>
                       <tr><td>PyTorch</td><td>2.10.0（VoiceStudio / 旧 2.0 回退）</td><td>VoiceStudio 使用独立 PyTorch/MPS 子进程；IndexTTS 2.5 主路径为 Torch-free MLX。</td></tr>
                       <tr><td>文档导入 / OCR</td><td>Calibre 9.13.0 / Tesseract 5</td><td>本机读取 TXT、MD、DOC、DOCX、PDF、EPUB、MOBI；扫描 PDF 使用本机中文 OCR。</td></tr>
-                      <tr><td>WebUI</td><td><strong>mlx-indextts 0.5.8</strong> + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持文本清洗、多人轮换朗读、六个引擎入口、电子书多章合并、队列、长文分段、暂停、终止、实时试听与音质检查。</td></tr>
+                      <tr><td>WebUI</td><td><strong>mlx-indextts 0.5.9</strong> + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持文本清洗、多人轮换朗读、六个引擎入口、电子书多章合并、队列、长文分段、暂停、终止、实时试听与音质检查。</td></tr>
                     </tbody>
                   </table>
                   <div class="about-changelog-title">版本变更日志</div>
+                  <section class="about-release">
+                    <div class="about-release-head"><strong>v0.5.9</strong><span>2026-09-30 · 多音色分句静音修复</span></div>
+                    <ul>
+                      <li>分句保留句末引号和连续标点；电子书换行产生的孤立标点并回正文，避免静音片段触发音质检查。</li>
+                      <li>同一音色连续负责的单元合并生成，保持原有轮换顺序和进度；真正的静音音频仍会被拦截。</li>
+                    </ul>
+                  </section>
                   <section class="about-release">
                     <div class="about-release-head"><strong>v0.5.8</strong><span>2026-09-30 · 夜间文案文本清洗与撤销</span></div>
                     <ul>
