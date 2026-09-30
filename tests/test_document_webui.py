@@ -306,6 +306,52 @@ def test_queue_chapter_selector_allows_multiple_chapters():
     assert events["confirm_queue_document"]["outputs"][-1] == queue_text["id"]
     assert events["mark_queue_document_edited"]["inputs"][-1] == queue_text["id"]
     assert queue_text["id"] != daytime_text["id"]
+    cleanup = next(event for event in events.values()
+                   if event["api_name"].startswith("clean_text_from_ui")
+                   and event["inputs"] == [queue_text["id"]])
+    undo = next(event for event in events.values()
+                if event["api_name"].startswith("undo_text_cleanup")
+                and event["outputs"][0] == queue_text["id"])
+    undo_state = cleanup["outputs"][1]
+    assert undo["inputs"] == [undo_state, queue_text["id"]]
+    assert undo_state != events["clean_text_from_ui"]["outputs"][1]
+    for operation in (cleanup, undo):
+        assert any(event["trigger_after"] == operation["id"]
+                   and event["api_name"].startswith("mark_queue_document_edited")
+                   for event in events.values())
+    for name in ("preview_queue_book_chapter", "preview_queue_document", "confirm_queue_document"):
+        assert any(event["trigger_after"] == events[name]["id"]
+                   and event["outputs"] == [undo_state]
+                   for event in events.values())
+
+
+@pytest.mark.parametrize("file_type", ["EPUB", "MOBI"])
+def test_queue_combined_text_cleanup_undo_and_confirmation(file_type):
+    source = {
+        "id": "ebook", "filename": f"book.{file_type.lower()}", "title": "测试书",
+        "document": {
+            "filename": f"book.{file_type.lower()}", "file_type": file_type, "title": "测试书",
+            "chapters": [
+                {"title": "第一章", "text": "第一章\n# 正文【12】。*** 😀\nhttps://example.com", "source_index": 0},
+                {"title": "第二章", "text": "第二章\n2026 年收入 100 元，增长 20%。", "source_index": 1},
+            ],
+        },
+    }
+    selected = ["1. 第一章", "2. 第二章"]
+    original, _ = preview_queue_book_chapter([source], "ebook", selected)
+    cleaned, snapshot, _ = webui.clean_text_from_ui(original)
+    assert cleaned == "第一章\n正文。\n\n第二章\n2026 年收入 100 元,增长 20%。"
+    restored, _, _ = webui.undo_text_cleanup(snapshot, cleaned)
+    assert restored == original
+    queue, _, _, _, _, _ = confirm_queue_document(
+        [], None, cleaned, [source], "ebook", selected
+    )
+    assert len(queue) == 1
+    assert queue[0]["text"] == cleaned
+    assert queue[0]["confirmed"] is True
+    queue, _ = webui.mark_queue_document_edited(queue, queue[0]["id"], restored)
+    assert queue[0]["confirmed"] is False
+    assert queue[0]["status"] == "pending"
 
 
 def test_multiple_documents_can_be_queued_previewed_confirmed_and_reordered(tmp_path: Path):
