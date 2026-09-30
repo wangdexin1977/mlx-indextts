@@ -286,11 +286,26 @@ def test_ebook_group_respects_combined_text_limit():
 
 def test_queue_chapter_selector_allows_multiple_chapters():
     demo = webui.build_ui()
+    components = demo.config["components"]
     selector = next(
-        component for component in demo.config["components"]
+        component for component in components
         if component.get("props", {}).get("label") == "选择本次要生成的章节（可多选）"
     )
     assert selector["props"]["multiselect"] is True
+    queue_text = next(
+        component for component in components
+        if component.get("props", {}).get("label") == "合成文字（本次任务）"
+    )
+    daytime_text = next(
+        component for component in components
+        if component.get("props", {}).get("label") == "合成文字"
+    )
+    events = {item["api_name"]: item for item in demo.config["dependencies"]}
+    assert events["preview_queue_book_chapter"]["outputs"][0] == queue_text["id"]
+    assert events["confirm_queue_document"]["inputs"][2] == queue_text["id"]
+    assert events["confirm_queue_document"]["outputs"][-1] == queue_text["id"]
+    assert events["mark_queue_document_edited"]["inputs"][-1] == queue_text["id"]
+    assert queue_text["id"] != daytime_text["id"]
 
 
 def test_multiple_documents_can_be_queued_previewed_confirmed_and_reordered(tmp_path: Path):

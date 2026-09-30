@@ -54,7 +54,7 @@ from mlx_indextts.narration_text import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.5.6"
+APP_VERSION = "0.5.7"
 MODEL_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2.5-int8"
 MODEL_V2_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2"
 OMNIVOICE_MODEL_DIR = PROJECT_ROOT / "models" / "OmniVoice-bfloat16"
@@ -5063,19 +5063,19 @@ def build_ui() -> gr.Blocks:
                 <span class="app-badge">Apple MLX</span>
                 <span class="app-badge">离线可用</span>
                 <span class="app-badge">OmniVoice 24 kHz</span>
-                <button id="about-open" class="about-trigger" type="button">关于 / v0.5.6</button>
+                <button id="about-open" class="about-trigger" type="button">关于 / v0.5.7</button>
               </div>
             </header>
 
             <div id="about-modal" class="about-modal" aria-hidden="true">
               <section class="about-card" role="dialog" aria-modal="true" aria-labelledby="about-title">
                 <div class="about-card-head">
-                  <h2 id="about-title">IndexTTS WebUI · v0.5.6</h2>
+                  <h2 id="about-title">IndexTTS WebUI · v0.5.7</h2>
                   <button id="about-close" class="about-close" type="button" aria-label="关闭">×</button>
                 </div>
                 <div class="about-card-body">
                   <div class="about-current">
-                    <strong>当前应用版本：v0.5.6（2026-09-30，夜间多章合并为一个音频任务）</strong><br>
+                    <strong>当前应用版本：v0.5.7（2026-09-30，夜间任务使用独立的合成文字框）</strong><br>
                     默认使用 OmniVoice、默认输出 MP3；六个引擎按需分时加载，避免同时占用统一内存。
                   </div>
                   <table class="about-table">
@@ -5093,10 +5093,17 @@ def build_ui() -> gr.Blocks:
                       <tr><td>MLX 推理引擎</td><td>0.31.1</td><td>运行于 Apple Silicon 统一内存和 GPU。</td></tr>
                       <tr><td>PyTorch</td><td>2.10.0（VoiceStudio / 旧 2.0 回退）</td><td>VoiceStudio 使用独立 PyTorch/MPS 子进程；IndexTTS 2.5 主路径为 Torch-free MLX。</td></tr>
                       <tr><td>文档导入 / OCR</td><td>Calibre 9.13.0 / Tesseract 5</td><td>本机读取 TXT、MD、DOC、DOCX、PDF、EPUB、MOBI；扫描 PDF 使用本机中文 OCR。</td></tr>
-                      <tr><td>WebUI</td><td><strong>mlx-indextts 0.5.6</strong> + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持文本清洗、多人轮换朗读、六个引擎入口、电子书多章合并、队列、长文分段、暂停、终止、实时试听与音质检查。</td></tr>
+                      <tr><td>WebUI</td><td><strong>mlx-indextts 0.5.7</strong> + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持文本清洗、多人轮换朗读、六个引擎入口、电子书多章合并、队列、长文分段、暂停、终止、实时试听与音质检查。</td></tr>
                     </tbody>
                   </table>
                   <div class="about-changelog-title">版本变更日志</div>
+                  <section class="about-release">
+                    <div class="about-release-head"><strong>v0.5.7</strong><span>2026-09-30 · 夜间多章合并文案直接显示在任务区</span></div>
+                    <ul>
+                      <li>夜间选中的多个章节按书中顺序合并到任务区的同一个“合成文字”框，检查和编辑后确认一次即生成一条队列任务。</li>
+                      <li>夜间任务文案与单文档模式分开，避免共用文本框造成预览位置不清或相互覆盖。</li>
+                    </ul>
+                  </section>
                   <section class="about-release">
                     <div class="about-release-head"><strong>v0.5.6</strong><span>2026-09-30 · 夜间多章合并为一个音频任务</span></div>
                     <ul>
@@ -5288,6 +5295,13 @@ def build_ui() -> gr.Blocks:
                         multiselect=True,
                         filterable=True,
                         visible=False,
+                    )
+                    queue_text = gr.Textbox(
+                        label="合成文字（本次任务）",
+                        placeholder="选择一章或多章后，所选正文会合并显示在这里；检查或编辑后确认一次，加入一个音频任务。",
+                        lines=10,
+                        max_lines=20,
+                        elem_classes=["queue-combined-text"],
                     )
                     document_queue_summary = gr.HTML(render_document_queue([]))
                     queue_document_selector = gr.Dropdown(
@@ -5889,36 +5903,36 @@ def build_ui() -> gr.Blocks:
         add_queue_event.then(
             fn=preview_added_queue_entry,
             inputs=[document_queue_state, queue_book_sources, queue_document_selector, queue_book_selector],
-            outputs=[text, status, queue_chapter_selector],
+            outputs=[queue_text, status, queue_chapter_selector],
             queue=False,
         )
         queue_book_selector.input(
             fn=preview_queue_book,
             inputs=[queue_book_sources, queue_book_selector, document_queue_state],
-            outputs=[queue_document_selector, text, status, queue_chapter_selector],
+            outputs=[queue_document_selector, queue_text, status, queue_chapter_selector],
             queue=False,
         )
         queue_document_selector.input(
             fn=preview_queue_document,
             inputs=[document_queue_state, queue_document_selector],
-            outputs=[text, status, queue_chapter_selector, queue_book_selector],
+            outputs=[queue_text, status, queue_chapter_selector, queue_book_selector],
             queue=False,
         )
         queue_chapter_selector.input(
             fn=preview_queue_book_chapter,
             inputs=[queue_book_sources, queue_book_selector, queue_chapter_selector],
-            outputs=[text, status],
+            outputs=[queue_text, status],
             queue=False,
         )
-        text.input(
+        queue_text.input(
             fn=mark_queue_document_edited,
-            inputs=[document_queue_state, queue_document_selector, text],
+            inputs=[document_queue_state, queue_document_selector, queue_text],
             outputs=[document_queue_state, document_queue_summary],
             queue=False,
         )
         queue_confirm_button.click(
             fn=confirm_queue_document,
-            inputs=[document_queue_state, queue_document_selector, text,
+            inputs=[document_queue_state, queue_document_selector, queue_text,
                     queue_book_sources, queue_book_selector, queue_chapter_selector],
             outputs=[
                 document_queue_state,
@@ -5926,7 +5940,7 @@ def build_ui() -> gr.Blocks:
                 document_queue_summary,
                 status,
                 queue_chapter_selector,
-                text,
+                queue_text,
             ],
             queue=False,
         )
@@ -5952,7 +5966,7 @@ def build_ui() -> gr.Blocks:
                 document_queue_state,
                 queue_document_selector,
                 document_queue_summary,
-                text,
+                queue_text,
                 status,
             ],
             queue=False,
@@ -5960,7 +5974,7 @@ def build_ui() -> gr.Blocks:
         queue_remove_event.then(
             fn=preview_queue_document,
             inputs=[document_queue_state, queue_document_selector],
-            outputs=[text, status, queue_chapter_selector, queue_book_selector],
+            outputs=[queue_text, status, queue_chapter_selector, queue_book_selector],
             queue=False,
         )
 

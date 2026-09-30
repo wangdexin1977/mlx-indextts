@@ -2,5 +2,5 @@
 
 from mlx_indextts.generate import IndexTTS
 
-__version__ = "0.5.6"
+__version__ = "0.5.7"
 __all__ = ["IndexTTS"]
