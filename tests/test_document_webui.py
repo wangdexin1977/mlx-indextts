@@ -164,6 +164,18 @@ def test_ebook_import_only_selected_chapter(tmp_path: Path, monkeypatch, extensi
     assert chapter_selector.visible is True
     assert len(chapter_selector.choices) == 3
     assert "已解析" in book_status
+    jump_selection = [chapter_selector.choices[2][1], chapter_selector.choices[0][1]]
+    jump_text, _ = preview_queue_book_chapter(
+        sources, book_selector.value, jump_selection
+    )
+    assert "第一章独有正文" in jump_text
+    assert "第三章独有正文" in jump_text
+    assert "第二章独有正文" not in jump_text
+    jump_queue, _, _, _, _, _ = confirm_queue_document(
+        [], None, jump_text, sources, book_selector.value, jump_selection
+    )
+    assert len(jump_queue) == 1
+    assert jump_queue[0]["selected_chapters"] == ["1. 第一章", "3. 第三章"]
     for number, title in enumerate(("第一章", "第二章", "第三章"), start=1):
         chapter_id = next(
             value for label, value in chapter_selector.choices if title in label
@@ -210,46 +222,66 @@ def test_ebook_can_confirm_multiple_chapters_then_select_more(file_type: str):
             "title": "章节书",
             "chapters": [
                 {"title": title, "text": f"{title}正文。", "source_index": index}
-                for index, title in enumerate(("第一章", "第二章", "第三章"))
+                for index, title in enumerate(("第一章", "第二章", "第三章", "第四章"))
             ],
         },
     }]
     _, _, _, selector = preview_queue_book(sources, "ebook", [])
-    assert len(selector.choices) == 3
-    first_batch = [selector.choices[1][1], selector.choices[0][1]]
+    assert len(selector.choices) == 4
+    first_batch = [selector.choices[2][1], selector.choices[0][1]]
     preview, status = preview_queue_book_chapter(sources, "ebook", first_batch)
+    daytime_text, _ = load_document_chapters(sources[0]["document"], first_batch)
+    assert preview == daytime_text
     assert "已选择 2 章" in status
-    assert preview.index("第一章正文") < preview.index("第二章正文")
-    with pytest.raises(Exception, match="章节边界已改变"):
-        confirm_queue_document(
-            [], None, preview.replace("【章节边界｜1. 第一章】", ""),
-            sources, "ebook", first_batch,
-        )
-    preview = preview.replace("第二章正文。", "第二章已校订正文。")
+    assert preview.index("第一章正文") < preview.index("第三章正文")
+    assert "第二章正文" not in preview
+    assert "第四章正文" not in preview
+    preview = preview.replace("第三章正文。", "第三章已校订正文。")
     queue, _, summary, message, next_selector, cleared_text = confirm_queue_document(
         [], None, preview, sources, "ebook", first_batch
     )
-    assert len(queue) == 2
-    assert [item["selected_chapters"] for item in queue] == [["1. 第一章"], ["2. 第二章"]]
-    assert [item["text"] for item in queue] == ["第一章正文。", "第二章已校订正文。"]
+    assert len(queue) == 1
+    assert queue[0]["selected_chapters"] == ["1. 第一章", "3. 第三章"]
+    assert queue[0]["text"] == "第一章正文。\n\n第三章已校订正文。"
     assert all(item["confirmed"] for item in queue)
     assert next_selector.value == []
-    assert [value for _label, value in next_selector.choices] == ["3. 第三章"]
+    assert [value for _label, value in next_selector.choices] == ["2. 第二章", "4. 第四章"]
     assert cleared_text == ""
-    assert "已确认 2/2" in summary
-    assert "每章单独生成音频" in message
+    assert "已确认 1/1" in summary
+    assert "合并为 1 个队列任务、生成 1 个音频" in message
 
-    third_id = next_selector.choices[0][1]
-    third_text, _ = preview_queue_book_chapter(sources, "ebook", [third_id])
+    second_batch = [value for _label, value in next_selector.choices]
+    second_text, _ = preview_queue_book_chapter(sources, "ebook", second_batch)
     queue, _, _, message, next_selector, _ = confirm_queue_document(
-        queue, None, third_text, sources, "ebook", [third_id]
+        queue, None, second_text, sources, "ebook", second_batch
     )
-    assert len(queue) == 3
-    assert queue[-1]["selected_chapters"] == ["3. 第三章"]
+    assert len(queue) == 2
+    assert queue[-1]["selected_chapters"] == ["2. 第二章", "4. 第四章"]
+    assert queue[-1]["text"] == "第二章正文。\n\n第四章正文。"
     assert next_selector.choices == []
     assert "已全部加入队列" in message
     with pytest.raises(Exception, match="已在队列"):
-        confirm_queue_document(queue, None, third_text, sources, "ebook", [third_id])
+        confirm_queue_document(queue, None, preview, sources, "ebook", first_batch)
+
+
+def test_ebook_group_respects_combined_text_limit():
+    source = {
+        "id": "ebook",
+        "filename": "long.epub",
+        "title": "长书",
+        "document": {
+            "filename": "long.epub", "file_type": "EPUB", "title": "长书",
+            "chapters": [
+                {"title": "第一章", "text": "甲" * 60_000, "source_index": 0},
+                {"title": "第二章", "text": "乙" * 60_000, "source_index": 1},
+            ],
+        },
+    }
+    chapter_ids = ["1. 第一章", "2. 第二章"]
+    preview, status = preview_queue_book_chapter([source], "ebook", chapter_ids)
+    assert "合并后超过单次合成上限" in status
+    with pytest.raises(Exception, match="超过长文合成上限"):
+        confirm_queue_document([], None, preview, [source], "ebook", chapter_ids)
 
 
 def test_queue_chapter_selector_allows_multiple_chapters():
@@ -393,14 +425,14 @@ def test_confirmed_document_queue_runs_sequentially_and_writes_manifest(
 
     final_queue = updates[-1][0]
     assert generated == [
-        "第一章正文。", "第二章正文。", "第三章正文。",
+        "第一章正文。\n\n第二章正文。", "第三章正文。",
         "第一份正文。", "第二份正文。",
     ]
-    assert [item["status"] for item in final_queue] == ["completed"] * 5
-    assert len({item["output"] for item in final_queue}) == 5
+    assert [item["status"] for item in final_queue] == ["completed"] * 4
+    assert len({item["output"] for item in final_queue}) == 4
     assert all(Path(item["output"]).exists() for item in final_queue)
     assert len(list(tmp_path.glob("文档转换队列_*.json"))) == 1
-    assert "成功 5 份" in updates[-1][3]
+    assert "成功 4 份" in updates[-1][3]
 
 
 def test_document_queue_uses_multi_voice_for_every_file(tmp_path: Path, monkeypatch):
