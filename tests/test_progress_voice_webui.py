@@ -254,14 +254,80 @@ def test_output_settings_are_validated_and_persisted(tmp_path: Path, monkeypatch
     assert config["output_directory"] == str(output_directory)
     assert webui._resolve_output_directory(str(output_directory)) == output_directory
     assert output_directory.is_dir()
+    demo = webui.build_ui()
+    output_field = next(
+        component for component in demo.config["components"]
+        if component.get("props", {}).get("label") == "输出文件夹"
+    )
+    assert output_field["props"]["value"] == str(output_directory)
+    assert any(
+        component.get("props", {}).get("value") == "选择文件夹"
+        for component in demo.config["components"]
+    )
+    assert any(
+        component.get("props", {}).get("value") == "使用此文件夹"
+        for component in demo.config["components"]
+    )
 
 
-def test_invalid_saved_output_format_falls_back_to_wav(tmp_path: Path, monkeypatch):
+def test_external_output_uses_temporary_playback_copy(tmp_path: Path, monkeypatch):
+    external = tmp_path / "external" / "result.mp3"
+    external.parent.mkdir()
+    external.write_bytes(b"audio data")
+    safe_temp = tmp_path / "safe-temp"
+    safe_temp.mkdir()
+    monkeypatch.setattr(webui, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(webui.tempfile, "gettempdir", lambda: str(safe_temp))
+    monkeypatch.setattr(webui.tempfile, "mkdtemp", lambda **_kwargs: str(safe_temp / "preview"))
+    monkeypatch.setattr(webui, "_schedule_directory_cleanup", lambda _directory: None)
+    (safe_temp / "preview").mkdir()
+
+    playable = webui._playable_audio_path(str(external))
+
+    assert playable == str(safe_temp / "preview" / "result.mp3")
+    assert Path(playable).read_bytes() == b"audio data"
+    assert external.read_bytes() == b"audio data"
+
+
+def test_choose_output_directory_persists_selection(tmp_path: Path, monkeypatch):
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    updates = []
+    monkeypatch.setattr(webui.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        webui.subprocess,
+        "run",
+        lambda *_args, **_kwargs: type("Result", (), {
+            "returncode": 0, "stdout": f"{selected}/\n", "stderr": "",
+        })(),
+    )
+    monkeypatch.setattr(webui, "update_user_config", lambda **kwargs: updates.append(kwargs))
+
+    chosen, status = webui.choose_output_directory("old-folder")
+
+    assert chosen == str(selected)
+    assert updates == [{"output_directory": str(selected)}]
+    assert str(selected) in status
+
+
+def test_apply_output_directory_creates_and_persists_folder(tmp_path: Path, monkeypatch):
+    selected = tmp_path / "new-folder"
+    updates = []
+    monkeypatch.setattr(webui, "update_user_config", lambda **kwargs: updates.append(kwargs))
+
+    status = webui.apply_output_directory(str(selected))
+
+    assert selected.is_dir()
+    assert updates == [{"output_directory": str(selected)}]
+    assert str(selected) in status
+
+
+def test_invalid_saved_output_format_falls_back_to_mp3(tmp_path: Path, monkeypatch):
     config_path = tmp_path / "settings.json"
     config_path.write_text('{"output_format": "aac"}', encoding="utf-8")
     monkeypatch.setattr(webui, "CONFIG_PATH", config_path)
 
-    assert webui.read_user_config()["output_format"] == "wav"
+    assert webui.read_user_config()["output_format"] == "mp3"
 
 
 def test_legacy_fish_token_limit_is_migrated_to_safe_minimum(tmp_path: Path, monkeypatch):
@@ -270,6 +336,22 @@ def test_legacy_fish_token_limit_is_migrated_to_safe_minimum(tmp_path: Path, mon
     monkeypatch.setattr(webui, "CONFIG_PATH", config_path)
 
     assert webui.read_user_config()["fish_max_tokens"] == 1024
+
+
+def test_retired_backend_settings_are_removed(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "settings.json"
+    config_path.write_text(
+        '{"model_backend":"GPT-SoVITS V4","gpt_sovits_batch_size":1,'
+        '"model_profiles":{"GPT-SoVITS V4":{"gpt_sovits_sample_steps":32}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(webui, "CONFIG_PATH", config_path)
+
+    config = webui.read_user_config()
+
+    assert config["model_backend"] == "OmniVoice"
+    assert not any(key.startswith("gpt_sovits") for key in config)
+    assert "GPT-SoVITS V4" not in config["model_profiles"]
 
 
 def test_default_audio_filename_uses_first_fifteen_copy_characters():
@@ -756,8 +838,12 @@ def test_about_panel_and_changelog_track_current_release():
     source = inspect.getsource(webui.build_ui)
     changelog = (webui.PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert webui.APP_VERSION == "0.3.4"
-    assert "关于 / v0.3.4" in source
+    assert webui.APP_VERSION == "0.5.4"
+    assert "关于 / v0.5.4" in source
+    assert "v0.5.4" in changelog
+    assert "夜间多文档队列沿用多音色轮换设置" in source
+    assert "硬链接共享" in source
+    assert "VoiceStudio v0.5.2" in source
     assert "版本变更日志" in source
     assert "v0.3.4" in changelog
     assert "v0.3.3" in changelog
@@ -1011,3 +1097,87 @@ def test_empty_recording_transition_keeps_current_voice(monkeypatch, tmp_path):
     assert result[3] == str(voice_path)
     assert result[4] == "音色库未改变"
     assert result[5] == "录音尚未完成；当前音色保持不变。"
+
+
+def test_model_parameter_profiles_are_independent_and_survive_reload(tmp_path, monkeypatch):
+    monkeypatch.setattr(webui, 'CONFIG_PATH', tmp_path / 'settings.json')
+    monkeypatch.setattr(webui, 'OUTPUT_DIR', tmp_path)
+    webui.update_user_config(model_backend='OmniVoice', speed=1.15, omnivoice_num_steps=48)
+    webui.switch_model_settings(webui.VOICESTUDIO_BACKEND)
+    config = webui.read_user_config()
+    assert config['speed'] == 1.0
+    assert config['omnivoice_num_steps'] == 32
+    webui.update_user_config(speed=0.85, omnivoice_num_steps=24)
+    webui.switch_model_settings('Fish Audio S2 Pro')
+    webui.update_user_config(speed=1.25, fish_temperature=0.9)
+    webui.switch_model_settings('OmniVoice')
+    assert webui.read_user_config()['speed'] == 1.15
+    assert webui.read_user_config()['omnivoice_num_steps'] == 48
+    webui.switch_model_settings(webui.VOICESTUDIO_BACKEND)
+    assert webui.read_user_config()['speed'] == 0.85
+    assert webui.read_user_config()['omnivoice_num_steps'] == 24
+    webui.switch_model_settings('Fish Audio S2 Pro')
+    assert webui.read_user_config()['fish_temperature'] == 0.9
+    assert webui.read_user_config()['speed'] == 1.25
+
+
+def test_voicestudio_dispatch_and_controls(monkeypatch):
+    model = object()
+    monkeypatch.setattr(webui, 'get_voicestudio_model', lambda: model)
+    assert webui._resolve_model_backend(webui.VOICESTUDIO_BACKEND, '跟随参考音频')[0] is model
+    controls = webui.update_model_controls(webui.VOICESTUDIO_BACKEND)
+    assert controls[0]['visible']
+    assert not controls[1]['visible']
+
+
+def test_omnivoice_expression_choices_and_preset_mapping():
+    control = webui.expression_control_update('OmniVoice', '高兴')
+    assert control['interactive'] is True
+    assert '平静' in control['choices']
+    assert '悲伤' in control['choices']
+    assert '高兴' in control['choices']
+
+    instruct, speed, class_temperature, position_temperature = (
+        webui._apply_omnivoice_expression('平静', 'female', 1.0, 0.2, 5.0)
+    )
+    assert instruct == 'moderate pitch, female'
+    assert speed == 0.95
+    assert class_temperature == 0.0
+    assert position_temperature == 4.5
+
+    with pytest.raises(ValueError, match='自定义表达'):
+        webui._apply_omnivoice_expression('自定义', '', 1.0, 0.0, 5.0)
+
+
+def test_reset_and_visibility_follow_selected_model(tmp_path, monkeypatch):
+    monkeypatch.setattr(webui, 'CONFIG_PATH', tmp_path / 'settings.json')
+    monkeypatch.setattr(webui, 'OUTPUT_DIR', tmp_path)
+    webui.update_user_config(model_backend='Fish Audio S2 Pro', fish_temperature=0.9)
+    webui.switch_model_settings(webui.VOICESTUDIO_BACKEND)
+    webui.update_user_config(omnivoice_num_steps=16)
+    outputs = webui.reset_selected_model_settings(webui.VOICESTUDIO_BACKEND)
+    assert webui.read_user_config()['omnivoice_num_steps'] == 32
+    assert '平静' in outputs[0]['choices']
+    assert outputs[-1]['visible'] is False
+    webui.switch_model_settings('Fish Audio S2 Pro')
+    assert webui.read_user_config()['fish_temperature'] == 0.9
+
+
+def test_legacy_omni_settings_are_captured_before_native_first_use(tmp_path, monkeypatch):
+    import json
+    path = tmp_path / 'settings.json'
+    path.write_text(json.dumps({'model_backend': 'Fish Audio S2 Pro', 'omnivoice_num_steps': 48}))
+    monkeypatch.setattr(webui, 'CONFIG_PATH', path)
+    monkeypatch.setattr(webui, 'OUTPUT_DIR', tmp_path)
+    webui.switch_model_settings(webui.VOICESTUDIO_BACKEND)
+    webui.update_user_config(omnivoice_num_steps=24)
+    webui.switch_model_settings('OmniVoice')
+    assert webui.read_user_config()['omnivoice_num_steps'] == 48
+
+
+def test_native_reference_transcript_is_independent(monkeypatch):
+    monkeypatch.setattr(webui, '_load_voice_entry', lambda _: {
+        'omnivoice_ref_text': 'MLX reference', 'voicestudio_ref_text': 'Native reference',
+    })
+    assert webui.load_voice_omnivoice_transcript('voice', 'OmniVoice') == 'MLX reference'
+    assert webui.load_voice_omnivoice_transcript('voice', webui.VOICESTUDIO_BACKEND) == 'Native reference'

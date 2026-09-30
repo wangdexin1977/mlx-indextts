@@ -19,7 +19,7 @@ SUPPORTED_EXTENSIONS = {".txt", ".md", ".markdown", ".doc", ".docx", ".pdf", ".e
 MAX_FILE_BYTES = 500 * 1024 * 1024
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 20_000
-CACHE_VERSION = 1
+CACHE_VERSION = 4
 
 
 class DocumentImportError(RuntimeError):
@@ -471,6 +471,26 @@ def _html_to_text(content: bytes | str) -> tuple[str, str]:
     return title, text
 
 
+def _is_navigation_page(content: bytes) -> bool:
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(content, "html.parser")
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+    body = soup.body or soup
+    links = body.find_all("a", href=True)
+    if len(links) < 2:
+        return False
+    total = count_effective_characters(body.get_text(" ", strip=True))
+    if total > 2000:
+        return False
+    link_lengths = [count_effective_characters(link.get_text(" ", strip=True)) for link in links]
+    if any(length > 120 for length in link_lengths):
+        return False
+    linked = sum(link_lengths)
+    return linked >= max(4, total // 4) and total - linked <= 40
+
+
 def _parse_epub(path: Path, display_filename: str | None = None) -> ImportedDocument:
     import ebooklib
     from ebooklib import epub
@@ -492,9 +512,21 @@ def _parse_epub(path: Path, display_filename: str | None = None) -> ImportedDocu
         seen_items.add(item.get_id())
         if item.get_type() != ebooklib.ITEM_DOCUMENT:
             return
-        title, text = _html_to_text(item.get_content())
+        content = item.get_content()
+        if content.count(b"href=") >= 2 and _is_navigation_page(content):
+            return
+        title, text = _html_to_text(content)
         if count_effective_characters(text) < 2:
             return
+        if not title:
+            first_line = text.split("\n", 1)[0].strip()
+            if re.fullmatch(
+                r"(?:第[一二三四五六七八九十百千万零〇两\d]{1,12}[章节回卷篇]|Chapter\s+\d+)"
+                r"(?:[：:\s\-—·].{1,60})?",
+                first_line,
+                flags=re.IGNORECASE,
+            ):
+                title = first_line
         chapters.append(
             DocumentChapter(
                 title=_safe_title(title, f"章节 {len(chapters) + 1}"),
@@ -691,13 +723,25 @@ def select_document_text(document: ImportedDocument | dict, selected_titles: lis
     if isinstance(document, dict):
         document = ImportedDocument.from_dict(document)
     if not selected_titles:
-        return document.text
-    selected = set(selected_titles)
-    chapters = [
-        chapter
-        for index, chapter in enumerate(document.chapters)
-        if chapter.title in selected or f"{index + 1}. {chapter.title}" in selected
-    ]
-    if not chapters:
         raise DocumentImportError("请至少选择一个章节。")
+    selected_indices = set()
+    choices = {
+        f"{index + 1}. {chapter.title}": index
+        for index, chapter in enumerate(document.chapters)
+    }
+    for title in selected_titles:
+        if title in choices:
+            selected_indices.add(choices[title])
+            continue
+        matches = [
+            index for index, chapter in enumerate(document.chapters)
+            if chapter.title == title
+        ]
+        if len(matches) != 1:
+            raise DocumentImportError("章节选择无效或标题重复，请从章节列表选择具体章节。")
+        selected_indices.add(matches[0])
+    chapters = [
+        chapter for index, chapter in enumerate(document.chapters)
+        if index in selected_indices
+    ]
     return join_chapters(chapters)

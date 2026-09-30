@@ -139,3 +139,37 @@ def test_fish_generation_rejects_audio_still_capped_at_safety_limit(tmp_path):
         )
 
     assert not target.exists()
+
+
+def test_encoded_reference_cache_reuses_invalidates_and_restores_on_error():
+    import mlx.core as mx
+
+    class Runtime:
+        calls = 0
+        fail = False
+
+        def _prepare_reference_prompt(self, audio, text):
+            self.calls += 1
+            return [text], [mx.array([1, 2, 3])]
+
+        def generate(self, ref_audio, ref_text):
+            value = self._prepare_reference_prompt(ref_audio, ref_text)
+            if self.fail:
+                raise RuntimeError('generation failed')
+            yield value
+
+    runtime = Runtime()
+    adapter = _adapter_with_runtime(runtime)
+    original = runtime._prepare_reference_prompt
+    audio = mx.zeros(100)
+    first = adapter._generate_results(ref_audio=audio, ref_text='one')
+    second = adapter._generate_results(ref_audio=audio, ref_text='one')
+    assert first[0] is second[0]
+    assert runtime.calls == 1
+    adapter._generate_results(ref_audio=audio, ref_text='two')
+    adapter._generate_results(ref_audio=mx.zeros(100), ref_text='two')
+    assert runtime.calls == 3
+    runtime.fail = True
+    with pytest.raises(RuntimeError, match='generation failed'):
+        adapter._generate_results(ref_audio=audio, ref_text='one')
+    assert runtime._prepare_reference_prompt == original

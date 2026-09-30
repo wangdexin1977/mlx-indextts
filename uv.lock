@@ -144,7 +144,7 @@ wheels = [
 
 [[package]]
 name = "auraloss"
-version = "0.4.0"
+version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -1917,7 +1917,7 @@ wheels = [
 
 [[package]]
 name = "mlx-indextts"
-version = "0.3.4"
+version = "0.5.4"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },

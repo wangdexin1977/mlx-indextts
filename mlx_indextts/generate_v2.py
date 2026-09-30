@@ -227,8 +227,11 @@ class IndexTTSv2:
 
         # Determine weight paths based on directory structure
         # Support both old structure (separate dirs) and new unified structure
-        if (self.mlx_model_dir / "gpt.safetensors").exists():
-            # New unified structure
+        if any((self.mlx_model_dir / name).exists() for name in (
+            "gpt.safetensors", "s2mel.safetensors", "bigvgan.safetensors",
+        )):
+            # Unified structure: a missing component must not silently fall
+            # back to randomly initialized weights.
             self.gpt_weights_path = str(self.mlx_model_dir / "gpt.safetensors")
             self.s2mel_weights_path = str(self.mlx_model_dir / "s2mel.safetensors")
             self.bigvgan_weights_path = str(self.mlx_model_dir / "bigvgan.safetensors")
@@ -237,6 +240,17 @@ class IndexTTSv2:
             self.gpt_weights_path = "models/gpt_v2/gpt_v2.safetensors"
             self.s2mel_weights_path = "models/s2mel_v2/s2mel.safetensors"
             self.bigvgan_weights_path = "models/bigvgan_v2/bigvgan_v2.safetensors"
+        missing_weights = [
+            path for path in (
+                self.gpt_weights_path, self.s2mel_weights_path,
+                self.bigvgan_weights_path,
+            ) if not Path(path).is_file()
+        ]
+        if missing_weights:
+            raise FileNotFoundError(
+                "IndexTTS 2.0 模型权重不完整，已阻止无权重推理："
+                + "、".join(missing_weights)
+            )
 
         # Load config
         self.cfg = OmegaConf.load(self.config_path)
@@ -478,11 +492,8 @@ class IndexTTSv2:
             print(f"  Model pre-quantized to {saved_quantize_bits}-bit")
             nn.quantize(self.gpt.gpt, bits=saved_quantize_bits, group_size=64)
 
-        if Path(self.gpt_weights_path).exists():
-            self.gpt.load_weights(self.gpt_weights_path)
-            print(f"GPT v2 (MLX) loaded from {self.gpt_weights_path}")
-        else:
-            print(f"Warning: GPT v2 weights not found at {self.gpt_weights_path}")
+        self.gpt.load_weights(self.gpt_weights_path)
+        print(f"GPT v2 (MLX) loaded from {self.gpt_weights_path}")
 
         # If runtime quantization requested (and model wasn't pre-quantized)
         if self.quantize_bits and not saved_quantize_bits:
@@ -492,22 +503,16 @@ class IndexTTSv2:
         # S2Mel (MLX) - we only use CFM part for inference
         print("Loading S2Mel (MLX)...")
         self.s2mel_mlx = S2Mel()
-        if Path(self.s2mel_weights_path).exists():
-            self.s2mel_mlx.load_weights(self.s2mel_weights_path)
-            print(f"S2Mel (MLX) loaded from {self.s2mel_weights_path}")
-        else:
-            print(f"Warning: S2Mel weights not found at {self.s2mel_weights_path}")
+        self.s2mel_mlx.load_weights(self.s2mel_weights_path)
+        print(f"S2Mel (MLX) loaded from {self.s2mel_weights_path}")
         self.s2mel_mlx.eval()  # Set to eval mode to disable dropout
 
         # BigVGAN v2 (MLX)
         print("Loading BigVGAN v2 (MLX)...")
         bigvgan_config = BigVGANV2Config()
         self.bigvgan_mlx = BigVGANV2(bigvgan_config)
-        if Path(self.bigvgan_weights_path).exists():
-            self.bigvgan_mlx.load_weights(self.bigvgan_weights_path)
-            print(f"BigVGAN v2 (MLX) loaded from {self.bigvgan_weights_path}")
-        else:
-            print(f"Warning: BigVGAN weights not found at {self.bigvgan_weights_path}")
+        self.bigvgan_mlx.load_weights(self.bigvgan_weights_path)
+        print(f"BigVGAN v2 (MLX) loaded from {self.bigvgan_weights_path}")
 
     def _init_tokenizer(self):
         """Initialize text tokenizer."""

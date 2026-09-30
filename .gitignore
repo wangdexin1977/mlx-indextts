@@ -43,6 +43,7 @@ ref_audios/
 outputs/
 examples_voice_01.wav
 /modelscope_cache/
+/vendor/cosyvoice3-macos/
 *.safetensors
 *.pth
 *.pt

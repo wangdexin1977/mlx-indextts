@@ -1,0 +1,8 @@
+# Native VoiceStudio model runtime; install with uv pip install -r requirements-voicestudio.txt
+# Keep the app checkout at ../VoiceStudio (v0.5.2); no desktop/frontend dependencies needed.
+torch==2.10.0
+torchaudio==2.10.0
+transformers==5.12.1
+accelerate==1.15.0
+pydub==0.25.1
+soundfile==0.13.1

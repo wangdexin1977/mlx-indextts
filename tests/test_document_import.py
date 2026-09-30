@@ -179,6 +179,53 @@ def test_epub_spine_order_and_chapters(tmp_path: Path):
     assert result.title == "电子书测试"
     assert [chapter.title for chapter in result.chapters][:2] == ["第一章", "第二章"]
     assert result.text.index("第一章正文") < result.text.index("第二章正文")
+    assert "第一章正文" not in select_document_text(result, ["2. 第二章"])
+    with pytest.raises(DocumentImportError, match="至少选择"):
+        select_document_text(result, [])
+
+
+def test_epub_keeps_long_chapter_even_when_text_is_linked(tmp_path: Path):
+    from ebooklib import epub
+
+    source = tmp_path / "linked-chapter.epub"
+    book = epub.EpubBook()
+    book.set_identifier("indextts-linked-chapter")
+    book.set_title("链接正文测试")
+    book.set_language("zh-CN")
+    chapter = epub.EpubHtml(title="第一章", file_name="chapter.xhtml", lang="zh-CN")
+    chapter.content = (
+        "<h1>第一章</h1><p><a href='#one'>"
+        + "长篇正文" * 800
+        + "</a></p><p><a href='#two'>注释</a></p>"
+    )
+    book.add_item(chapter)
+    book.spine = ["nav", chapter]
+    book.add_item(epub.EpubNav())
+    book.add_item(epub.EpubNcx())
+    epub.write_epub(str(source), book)
+
+    result = import_document(source)
+    assert len(result.chapters) == 1
+    assert "长篇正文" in result.chapters[0].text
+
+
+def test_duplicate_chapter_titles_select_only_the_requested_index():
+    from mlx_indextts.document_import import DocumentChapter, ImportedDocument
+
+    document = ImportedDocument(
+        filename="duplicate.epub",
+        file_type="EPUB",
+        title="重复标题",
+        chapters=[
+            DocumentChapter("前言", "第一段正文。", 0),
+            DocumentChapter("前言", "第二段正文。", 1),
+        ],
+    )
+    selected = select_document_text(document, ["2. 前言"])
+    assert "第二段正文" in selected
+    assert "第一段正文" not in selected
+    with pytest.raises(DocumentImportError, match="标题重复"):
+        select_document_text(document, ["前言"])
 
 
 def test_real_mobi_conversion_and_chapter_order(tmp_path: Path):
@@ -212,9 +259,20 @@ def test_real_mobi_conversion_and_chapter_order(tmp_path: Path):
     result = import_document(source_mobi)
 
     assert result.file_type == "MOBI"
+    assert [chapter.title for chapter in result.chapters] == ["第一章", "第二章"]
     assert "第一章正文内容" in result.text
     assert "第二章正文内容" in result.text
     assert result.text.index("第一章正文") < result.text.index("第二章正文")
+    selected = select_document_text(
+        result,
+        [
+            f"{index + 1}. {chapter.title}"
+            for index, chapter in enumerate(result.chapters)
+            if "第二章正文" in chapter.text
+        ],
+    )
+    assert "第二章正文" in selected
+    assert "第一章正文" not in selected
 
 
 def test_cache_round_trip(tmp_path: Path):

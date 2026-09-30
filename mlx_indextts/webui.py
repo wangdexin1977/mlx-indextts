@@ -10,6 +10,8 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -31,7 +33,10 @@ from mlx_indextts.generate_v2 import (
 )
 from mlx_indextts.generate_v25 import IndexTTSv25
 from mlx_indextts.generate_fish_s2 import FishS2ProTTS
+from mlx_indextts.generate_cosyvoice3 import CosyVoice3TTS
+from mlx_indextts.audio_gain import boost_wav
 from mlx_indextts.generate_omnivoice import OmniVoiceTTS
+from mlx_indextts.generate_voicestudio import VoiceStudioTTS
 from mlx_indextts.document_import import (
     DocumentImportError,
     ImportedDocument,
@@ -41,15 +46,29 @@ from mlx_indextts.document_import import (
     select_document_text,
 )
 from mlx_indextts.power_monitor import start_macos_power_monitor
+from mlx_indextts.narration_text import (
+    assign_voices_to_units,
+    clean_narration_text,
+    split_narration_units,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.3.4"
+APP_VERSION = "0.5.4"
 MODEL_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2.5-int8"
 MODEL_V2_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2"
 OMNIVOICE_MODEL_DIR = PROJECT_ROOT / "models" / "OmniVoice-bfloat16"
 OMNIVOICE_ASR_MODEL_DIR = PROJECT_ROOT / "models" / "Qwen3-ASR-0.6B-8bit"
 FISH_S2_MODEL_DIR = PROJECT_ROOT / "models" / "fish-audio-s2-pro-8bit"
+COSYVOICE3_MODEL_DIR = PROJECT_ROOT / "models" / "Fun-CosyVoice3-0.5B-2512"
+COSYVOICE3_REQUIRED_WEIGHTS = {
+    "llm.pt": 2024669519,
+    "flow.pt": 1329116148,
+    "hift.pt": 83202622,
+    "speech_tokenizer_v3.onnx": 969451503,
+    "campplus.onnx": 28303423,
+    "CosyVoice-BlankEN/model.safetensors": 988097824,
+}
 DEFAULT_SPEAKER = PROJECT_ROOT / "outputs" / "voice_01_speaker.npz"
 DEFAULT_VOICE_PREVIEW = PROJECT_ROOT / "outputs" / "voice_01_preview.wav"
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "webui"
@@ -69,7 +88,7 @@ MAX_SYNTHESIS_BATCH_SEGMENTS = 32
 MLX_CACHE_CLEAR_THRESHOLD_BYTES = 2 * 1024 * 1024 * 1024
 
 DEFAULT_SETTINGS = {
-    "model_backend": "IndexTTS 2.5",
+    "model_backend": "OmniVoice",
     "emotion": "跟随参考音频",
     "emotion_strength": 0.6,
     "speed": 1.0,
@@ -114,7 +133,33 @@ DEFAULT_FISH_S2_SETTINGS = {
     "fish_ref_audio_max_duration_s": 15.0,
 }
 
-MODEL_BACKENDS = ("IndexTTS 2.5", "IndexTTS 2.0", "OmniVoice", "Fish Audio S2 Pro")
+DEFAULT_COSYVOICE3_SETTINGS = {
+    "cosy_ref_text": "",
+    "cosy_precision": "fp16",
+    "cosy_nfe": 10,
+    "cosy_ref_audio_max_duration_s": 10.0,
+}
+
+VOICESTUDIO_BACKEND = "VoiceStudio · OmniVoice 原生"
+OMNIVOICE_BACKENDS = {"OmniVoice", VOICESTUDIO_BACKEND}
+MODEL_BACKENDS = (
+    "IndexTTS 2.5", "IndexTTS 2.0", "OmniVoice", "Fish Audio S2 Pro",
+    VOICESTUDIO_BACKEND, "CosyVoice 3",
+)
+MODEL_PARAMETER_DEFAULTS = {
+    **DEFAULT_SETTINGS,
+    **DEFAULT_OMNIVOICE_SETTINGS,
+    **DEFAULT_FISH_S2_SETTINGS,
+    **DEFAULT_COSYVOICE3_SETTINGS,
+}
+MODEL_PARAMETER_DEFAULTS.pop("model_backend")
+
+
+def _model_parameter_defaults(backend: str) -> dict:
+    values = dict(MODEL_PARAMETER_DEFAULTS)
+    if backend == "IndexTTS 2.0":
+        values["diffusion_steps"] = 16
+    return values
 
 EMOTIONS = {
     "自然/平静": "calm",
@@ -126,6 +171,38 @@ EMOTIONS = {
     "低落": "melancholic",
     "惊讶": "surprised",
     "跟随参考音频": None,
+}
+
+# OmniVoice has no IndexTTS-style emotion vector.  These user-facing choices
+# are honest expression presets built only from controls supported by the
+# pinned runtime.  Whisper is native; the named emotions are approximations.
+OMNIVOICE_EXPRESSION_PRESETS = {
+    "跟随参考音频": {"instruct": "", "params": {}},
+    "平静": {
+        "instruct": "moderate pitch",
+        "params": {"speed": 0.95, "class_temperature": 0.0, "position_temperature": 4.5},
+    },
+    "高兴": {
+        "instruct": "high pitch",
+        "params": {"speed": 1.06, "class_temperature": 0.1, "position_temperature": 5.5},
+    },
+    "悲伤": {
+        "instruct": "low pitch",
+        "params": {"speed": 0.9, "class_temperature": 0.0, "position_temperature": 4.5},
+    },
+    "激昂": {
+        "instruct": "high pitch",
+        "params": {"speed": 1.1, "class_temperature": 0.15, "position_temperature": 6.0},
+    },
+    "严肃": {
+        "instruct": "low pitch",
+        "params": {"speed": 0.96, "class_temperature": 0.0, "position_temperature": 4.5},
+    },
+    "耳语": {
+        "instruct": "whisper",
+        "params": {"speed": 0.92, "class_temperature": 0.0, "position_temperature": 4.5},
+    },
+    "自定义": {"instruct": "", "params": {}},
 }
 
 _model: IndexTTSv25 | IndexTTSv2 | OmniVoiceTTS | FishS2ProTTS | None = None
@@ -296,6 +373,30 @@ body, .gradio-container {
   color: #b42318;
 }
 .text-counter-over-limit strong { color: #dc2626; }
+.text-cleanup-actions { margin: 7px 0 3px !important; }
+.multi-voice-narration {
+  margin: 8px 0 !important;
+  border: 1px solid #9fc1e7 !important;
+  border-radius: 9px !important;
+  background: #f6faff !important;
+}
+.multi-voice-summary, .multi-voice-empty {
+  margin: 6px 0;
+  color: #405a78;
+  font-size: 13px;
+}
+.multi-voice-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.multi-voice-table th, .multi-voice-table td {
+  padding: 7px 8px;
+  border: 1px solid #d3e0ef;
+  text-align: left;
+  vertical-align: top;
+}
+.multi-voice-table th { background: #eaf3fd; color: #294866; }
 .document-queue {
   margin-bottom: 8px !important;
   border: 1px solid #8eb9e8 !important;
@@ -499,10 +600,6 @@ body, .gradio-container {
   font-weight: 760 !important;
 }
 .voice-library-summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
   padding: 7px 9px;
   border: 1px solid #d6e4f3;
   border-radius: 7px;
@@ -511,11 +608,6 @@ body, .gradio-container {
   font-size: 12px;
 }
 .voice-library-summary strong { color: #174b85; font-size: 13px; }
-.voice-library-summary span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .voice-library-guide {
   padding: 10px 12px;
   border: 1px solid #8fc2f4;
@@ -972,12 +1064,25 @@ body, .gradio-container {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.output-settings {
-  gap: 8px !important;
-  margin-bottom: 7px !important;
+.output-directory-field { min-width: 0 !important; }
+.output-directory-field label { white-space: nowrap !important; }
+.output-directory-field textarea {
+  white-space: nowrap !important;
+  overflow-x: auto !important;
+  overflow-y: hidden !important;
+  word-break: normal !important;
+  resize: none !important;
 }
-.output-settings .form { min-width: 0 !important; }
-.output-folder-action { min-width: 112px !important; }
+.output-folder-actions {
+  gap: 6px !important;
+  flex-wrap: nowrap !important;
+  margin: 5px 0 7px !important;
+}
+.output-folder-action {
+  min-width: 0 !important;
+  white-space: nowrap !important;
+  font-size: 13px !important;
+}
 .output-location textarea { font-size: 13px !important; }
 .voice-preview { margin: -2px 0 2px !important; }
 .voice-preview audio { height: 38px !important; }
@@ -1128,7 +1233,6 @@ button[aria-label="Toggle Sidebar"]::after {
     min-height: 300px !important;
     height: 300px !important;
   }
-  .voice-library-summary { align-items: flex-start; flex-direction: column; }
 }
 """
 
@@ -1151,6 +1255,8 @@ def get_model() -> IndexTTSv25:
 def _release_loaded_model_unlocked() -> None:
     """Release the inactive backend before loading the other large model."""
     global _model, _model_backend
+    if isinstance(_model, (VoiceStudioTTS, CosyVoice3TTS)):
+        _model.close()
     _model = None
     _model_backend = None
     gc.collect()
@@ -1199,6 +1305,21 @@ def get_omnivoice_model() -> OmniVoiceTTS:
     return _model
 
 
+def get_voicestudio_model() -> VoiceStudioTTS:
+    global _model, _model_backend
+    if _model is None or _model_backend != "voicestudio":
+        with _model_lock:
+            if _model is None or _model_backend != "voicestudio":
+                _release_loaded_model_unlocked()
+                _model = VoiceStudioTTS(
+                    str(PROJECT_ROOT.parent / "VoiceStudio"),
+                    str(PROJECT_ROOT / "models/VoiceStudio-OmniVoice"),
+                    asr_model_dir=str(OMNIVOICE_ASR_MODEL_DIR),
+                )
+                _model_backend = "voicestudio"
+    return _model
+
+
 def get_fish_s2_model() -> FishS2ProTTS:
     """Load Fish Audio S2 Pro 8-bit on demand and release the prior backend."""
     global _model, _model_backend
@@ -1217,18 +1338,43 @@ def get_fish_s2_model() -> FishS2ProTTS:
     return _model
 
 
+def get_cosyvoice3_model() -> CosyVoice3TTS:
+    """Load the full-weight CosyVoice3 Mac backend on demand."""
+    global _model, _model_backend
+    if _model is None or _model_backend != "cosyvoice3":
+        with _model_lock:
+            if _model is None or _model_backend != "cosyvoice3":
+                _release_loaded_model_unlocked()
+                if not (COSYVOICE3_MODEL_DIR / "cosyvoice3.yaml").is_file():
+                    raise RuntimeError(f"找不到 CosyVoice3 模型目录：{COSYVOICE3_MODEL_DIR}")
+                incomplete = [
+                    relative for relative, size in COSYVOICE3_REQUIRED_WEIGHTS.items()
+                    if not (COSYVOICE3_MODEL_DIR / relative).is_file()
+                    or (COSYVOICE3_MODEL_DIR / relative).stat().st_size != size
+                ]
+                if incomplete:
+                    raise RuntimeError("CosyVoice3 权重尚未完整安装：" + "、".join(incomplete))
+                _model = CosyVoice3TTS(
+                    str(COSYVOICE3_MODEL_DIR), str(OMNIVOICE_ASR_MODEL_DIR),
+                )
+                _model_backend = "cosyvoice3"
+    assert isinstance(_model, CosyVoice3TTS)
+    return _model
+
+
 def _read_config_unlocked() -> dict:
     config = {
         **DEFAULT_SETTINGS,
         **DEFAULT_OMNIVOICE_SETTINGS,
         **DEFAULT_FISH_S2_SETTINGS,
+        **DEFAULT_COSYVOICE3_SETTINGS,
         "reference_audio": None,
         "reference_conditioning": None,
         "reference_cache_version": None,
         "optimized_duration": None,
         "voice_name": None,
         "voice_library_id": None,
-        "output_format": "wav",
+        "output_format": "mp3",
         "output_directory": str(OUTPUT_DIR),
         "model_version": "2.5",
     }
@@ -1257,16 +1403,48 @@ def _read_config_unlocked() -> dict:
         config["emotion"] = DEFAULT_SETTINGS["emotion"]
     if config.get("model_backend") not in MODEL_BACKENDS:
         old_version = str(config.get("model_version") or "2.5")
-        config["model_backend"] = "IndexTTS 2.0" if old_version.startswith("2.0") else "IndexTTS 2.5"
+        config["model_backend"] = "IndexTTS 2.0" if old_version.startswith("2.0") else "OmniVoice"
     if str(config.get("output_format", "")).lower() not in OUTPUT_FORMATS:
-        config["output_format"] = "wav"
+        config["output_format"] = "mp3"
     if not str(config.get("output_directory") or "").strip():
         config["output_directory"] = str(OUTPUT_DIR)
+    output_directory = Path(str(config["output_directory"]))
+    while output_directory.name.startswith(".multi_voice_"):
+        output_directory = output_directory.parent
+    config["output_directory"] = str(output_directory)
     try:
         if int(config.get("fish_max_tokens") or 0) < FishS2ProTTS.MIN_AUDIO_TOKENS:
             config["fish_max_tokens"] = FishS2ProTTS.MIN_AUDIO_TOKENS
     except (TypeError, ValueError):
         config["fish_max_tokens"] = FishS2ProTTS.MIN_AUDIO_TOKENS
+    if not config.get("model_profiles"):
+        # Capture legacy engine-specific values before the first model switch.
+        profiles = {}
+        for backend in MODEL_BACKENDS:
+            values = _model_parameter_defaults(backend)
+            if backend == "OmniVoice":
+                values.update({key: config[key] for key in DEFAULT_OMNIVOICE_SETTINGS})
+            elif backend == "Fish Audio S2 Pro":
+                values.update({key: config[key] for key in DEFAULT_FISH_S2_SETTINGS})
+            elif backend == "CosyVoice 3":
+                values.update({key: config[key] for key in DEFAULT_COSYVOICE3_SETTINGS})
+            if backend == config["model_backend"]:
+                values.update({key: config[key] for key in MODEL_PARAMETER_DEFAULTS})
+            profiles[backend] = values
+        config["model_profiles"] = profiles
+    # Remove settings left by versions that exposed the retired GPT-SoVITS
+    # backend, including nested per-model profiles.
+    for key in tuple(config):
+        if key.startswith("gpt_sovits"):
+            config.pop(key, None)
+    profiles = dict(config.get("model_profiles") or {})
+    profiles.pop("GPT-SoVITS V4", None)
+    for backend, profile in tuple(profiles.items()):
+        profiles[backend] = {
+            key: value for key, value in dict(profile).items()
+            if not key.startswith("gpt_sovits")
+        }
+    config["model_profiles"] = profiles
     return config
 
 
@@ -1280,7 +1458,12 @@ def update_user_config(**updates: object) -> None:
     """Atomically update the local persistent configuration."""
     with _config_lock:
         config = _read_config_unlocked()
+        profiles = dict(config.get("model_profiles") or {})
+        old_backend = config["model_backend"]
+        profiles[old_backend] = {key: config[key] for key in MODEL_PARAMETER_DEFAULTS}
         config.update(updates)
+        profiles[config["model_backend"]] = {key: config[key] for key in MODEL_PARAMETER_DEFAULTS}
+        config["model_profiles"] = profiles
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         temporary_path = CONFIG_PATH.with_suffix(".tmp")
         temporary_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1288,8 +1471,8 @@ def update_user_config(**updates: object) -> None:
 
 
 def _normalise_output_format(value: str | None) -> str:
-    output_format = str(value or "wav").strip().lower()
-    return output_format if output_format in OUTPUT_FORMATS else "wav"
+    output_format = str(value or "mp3").strip().lower()
+    return output_format if output_format in OUTPUT_FORMATS else "mp3"
 
 
 def _resolve_output_directory(value: str | None, *, create: bool = True) -> Path:
@@ -1451,6 +1634,63 @@ def _schedule_directory_cleanup(directory: Path, delay_seconds: float = 300.0) -
     )
     cleanup_timer.daemon = True
     cleanup_timer.start()
+
+
+def _playable_audio_path(path: str | None) -> str | None:
+    """Give Gradio a file it can serve, even when the saved output is elsewhere."""
+    if not path:
+        return path
+    source = Path(path).resolve()
+    if source.is_relative_to(PROJECT_ROOT) or source.is_relative_to(Path(tempfile.gettempdir()).resolve()):
+        return path
+    preview_directory = Path(tempfile.mkdtemp(prefix="indextts-playback-"))
+    try:
+        preview_path = preview_directory / source.name
+        try:
+            os.link(source, preview_path)
+        except OSError:
+            shutil.copy2(source, preview_path)
+    except Exception:
+        shutil.rmtree(preview_directory, ignore_errors=True)
+        raise
+    _schedule_directory_cleanup(preview_directory)
+    return str(preview_path)
+
+
+def choose_output_directory(current_directory: str) -> tuple[str, str]:
+    """Select a local output folder with the macOS folder picker."""
+    if sys.platform != "darwin":
+        raise gr.Error("请在输出文件夹输入框中填写目录路径。")
+    result = subprocess.run(
+        [
+            "/usr/bin/osascript",
+            "-e",
+            'POSIX path of (choose folder with prompt "选择音频输出文件夹")',
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        if "(-128)" in result.stderr:
+            return current_directory, "已取消选择输出文件夹。"
+        raise gr.Error(f"选择输出文件夹失败：{result.stderr.strip() or '未知错误'}")
+    try:
+        directory = _resolve_output_directory(result.stdout.strip(), create=False)
+    except (OSError, ValueError) as exc:
+        raise gr.Error(f"输出文件夹不可用：{exc}") from exc
+    update_user_config(output_directory=str(directory))
+    return str(directory), f"音频将保存到：{directory}"
+
+
+def apply_output_directory(value: str) -> str:
+    """Validate and save a directory typed into the output field."""
+    try:
+        directory = _resolve_output_directory(value)
+    except (OSError, ValueError) as exc:
+        raise gr.Error(f"输出文件夹不可用：{exc}") from exc
+    update_user_config(output_directory=str(directory))
+    return f"音频将保存到：{directory}"
 
 
 def open_output_directory(output_directory: str) -> str:
@@ -1659,7 +1899,6 @@ def render_voice_library_summary() -> str:
     return f"""
     <div class="voice-library-summary">
       <strong>已保存 {len(entries)} 个音色 · 常用 {favorite_count}/10</strong>
-      <span>文件保存在 {html.escape(str(_voice_library_root()))}</span>
     </div>
     """
 
@@ -1931,6 +2170,72 @@ def count_text_characters(text: str | None) -> str:
       </span>
     </div>
     """
+
+
+def clean_text_from_ui(text: str | None) -> tuple[str, str, str]:
+    """Clean the editor text and keep one undo snapshot."""
+    original = str(text or "")
+    cleaned = clean_narration_text(original)
+    if not original.strip():
+        raise gr.Error("请先输入或载入需要清洗的文字。")
+    if not cleaned:
+        raise gr.Error("清洗后没有可朗读内容，请检查原文。")
+    removed = max(0, len(original) - len(cleaned))
+    return cleaned, original, f"文本格式清洗完成｜已整理空白、标记和无效符号，共减少 {removed} 个字符。"
+
+
+def undo_text_cleanup(previous_text: str | None, current_text: str | None) -> tuple[str, str, str]:
+    """Restore the last pre-cleanup snapshot and keep the current text for redo."""
+    if previous_text is None or previous_text == "":
+        raise gr.Error("没有可撤销的文本清洗记录。")
+    return str(previous_text), str(current_text or ""), "已恢复清洗前的文字。"
+
+
+def render_multi_voice_plan(
+    text: str | None,
+    voice_ids: list[str] | None,
+    split_mode: str,
+    switch_every: float,
+) -> str:
+    """Render a compact, auditable preview of round-robin speaker assignment."""
+    units = split_narration_units(text, split_mode)
+    selected = list(dict.fromkeys(str(item) for item in (voice_ids or []) if item))
+    assignments = assign_voices_to_units(units, selected, int(switch_every or 1))
+    if not units:
+        return '<div class="multi-voice-empty">输入文字后，可预览每段由谁朗读。</div>'
+    if len(selected) < 2:
+        return '<div class="multi-voice-empty">请至少选择两种音色，再分析朗读顺序。</div>'
+    names = {
+        voice_id: str((_load_voice_entry(voice_id) or {}).get("name") or voice_id[:8])
+        for voice_id in selected
+    }
+    rows = []
+    for index, (unit, voice_id) in enumerate(assignments[:20], start=1):
+        preview = re.sub(r"\s+", " ", unit).strip()
+        if len(preview) > 58:
+            preview = preview[:58] + "…"
+        rows.append(
+            "<tr>"
+            f"<td>{index}</td><td>{html.escape(names.get(voice_id, voice_id[:8]))}</td>"
+            f"<td>{html.escape(preview)}</td>"
+            "</tr>"
+        )
+    remainder = len(assignments) - len(rows)
+    note = f"，另有 {remainder} 个单元未展开" if remainder > 0 else ""
+    return (
+        f'<div class="multi-voice-summary">共 {len(assignments)} 个朗读单元、'
+        f'{len(selected)} 种音色，按选择顺序循环{note}。</div>'
+        '<table class="multi-voice-table"><thead><tr><th>顺序</th><th>朗读音色</th><th>内容预览</th></tr></thead>'
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def refresh_multi_voice_choices(selected: list[str] | None = None) -> dict:
+    """Refresh the multi-speaker picker without retaining deleted voices."""
+    choices = _voice_library_choices()
+    valid_ids = {str(value) for _label, value in choices}
+    value = [str(item) for item in (selected or []) if str(item) in valid_ids]
+    return gr.Dropdown(choices=choices, value=value)
 
 
 def _validate_synthesis_text(text: str | None) -> str:
@@ -2364,12 +2669,12 @@ def save_user_settings(
 ) -> None:
     """Persist all adjustable synthesis settings."""
     update_user_config(
-        model_backend=model_backend if model_backend in MODEL_BACKENDS else "IndexTTS 2.5",
+        model_backend=model_backend if model_backend in MODEL_BACKENDS else "OmniVoice",
         model_version=(
             "2.0"
             if model_backend == "IndexTTS 2.0"
             else "OmniVoice"
-            if model_backend == "OmniVoice"
+            if model_backend in OMNIVOICE_BACKENDS
             else "Fish Audio S2 Pro"
             if model_backend == "Fish Audio S2 Pro"
             else "2.5"
@@ -2463,14 +2768,18 @@ def load_omnivoice_settings() -> tuple:
     config = read_user_config()
     entry = _load_voice_entry(config.get("voice_library_id"))
     values = dict(config)
-    values["omnivoice_ref_text"] = str(entry.get("omnivoice_ref_text") or "") if entry else ""
+    values["omnivoice_ref_text"] = str(entry.get(_omnivoice_transcript_key(config["model_backend"])) or "") if entry else ""
     return tuple(values[key] for key in DEFAULT_OMNIVOICE_SETTINGS)
 
 
-def load_voice_omnivoice_transcript(voice_id: str | None) -> str:
+def _omnivoice_transcript_key(model_backend: str) -> str:
+    return "voicestudio_ref_text" if model_backend == VOICESTUDIO_BACKEND else "omnivoice_ref_text"
+
+
+def load_voice_omnivoice_transcript(voice_id: str | None, model_backend: str = "OmniVoice") -> str:
     """Keep the alignment transcript attached to its matching voice."""
     entry = _load_voice_entry(voice_id)
-    return str(entry.get("omnivoice_ref_text") or "") if entry else ""
+    return str(entry.get(_omnivoice_transcript_key(model_backend)) or "") if entry else ""
 
 
 def save_fish_s2_settings(
@@ -2502,11 +2811,25 @@ def load_voice_fish_transcript(voice_id: str | None) -> str:
     return str(entry.get("fish_ref_text") or "") if entry else ""
 
 
+def save_cosyvoice3_settings(ref_text: str, precision: str, nfe: float, ref_duration: float) -> None:
+    update_user_config(
+        cosy_ref_text=str(ref_text or ""),
+        cosy_precision=str(precision),
+        cosy_nfe=int(nfe),
+        cosy_ref_audio_max_duration_s=float(ref_duration),
+    )
+
+
+def load_voice_cosy_transcript(voice_id: str | None) -> str:
+    entry = _load_voice_entry(voice_id)
+    return str(entry.get("cosy_ref_text") or "") if entry else ""
+
+
 def update_model_controls(model_backend: str) -> tuple:
     """Show only controls that affect the selected backend."""
     if model_backend == "IndexTTS 2.0":
         return gr.update(visible=False), gr.update(visible=False), gr.update(interactive=True)
-    if model_backend == "OmniVoice":
+    if model_backend in OMNIVOICE_BACKENDS:
         return gr.update(visible=True), gr.update(visible=False), gr.update(interactive=False)
     if model_backend == "Fish Audio S2 Pro":
         return gr.update(visible=False), gr.update(visible=True), gr.update(interactive=False)
@@ -2515,6 +2838,70 @@ def update_model_controls(model_backend: str) -> tuple:
         gr.update(visible=False),
         gr.update(value="跟随参考音频", interactive=False),
     )
+
+
+def expression_control_update(model_backend: str, value: str) -> dict:
+    """Return the model-specific expression choices without mixing semantics."""
+    if model_backend == "IndexTTS 2.0":
+        selected = value if value in EMOTIONS else "自然/平静"
+        return gr.update(
+            choices=list(EMOTIONS), value=selected, interactive=True,
+            info="IndexTTS 2.0 原生情绪控制。",
+        )
+    if model_backend in OMNIVOICE_BACKENDS:
+        selected = value if value in OMNIVOICE_EXPRESSION_PRESETS else "跟随参考音频"
+        return gr.update(
+            choices=list(OMNIVOICE_EXPRESSION_PRESETS), value=selected,
+            interactive=True,
+            info=(
+                "OmniVoice 表达预设：耳语为原生风格；平静、高兴、悲伤等"
+                "由音高、语速和采样参数近似实现。"
+            ),
+        )
+    if model_backend == "IndexTTS 2.5":
+        return gr.update(
+            choices=["跟随参考音频"], value="跟随参考音频",
+            interactive=False,
+            info="IndexTTS 2.5 跟随参考音频的表达。",
+        )
+    return gr.update(
+        choices=["不适用"], value="不适用", interactive=False,
+        info="当前模型使用自己的风格设置。",
+    )
+
+
+def switch_model_settings(model_backend: str) -> tuple:
+    """Restore a separate parameter profile, without rewriting other models."""
+    if model_backend not in MODEL_BACKENDS:
+        raise ValueError("未知语音模型")
+    with _config_lock:
+        config = _read_config_unlocked()
+        if config["model_backend"] == model_backend:
+            values = {key: config[key] for key in MODEL_PARAMETER_DEFAULTS}
+        else:
+            values = _model_parameter_defaults(model_backend)
+            values.update((config.get("model_profiles") or {}).get(model_backend, {}))
+        update_user_config(model_backend=model_backend, **values)
+    index_only = {"emotion", "emotion_strength", "segment_overlap_ms", "temperature", "diffusion_steps", "max_mel_tokens", "top_p", "top_k", "repetition_penalty", "cfg_rate", "fast_vocoder"}
+    is_index = model_backend.startswith("IndexTTS")
+    common = [gr.update(value=values[key], visible=is_index or key not in index_only)
+              for key in DEFAULT_SETTINGS if key != "model_backend"]
+    omni = [values[key] for key in DEFAULT_OMNIVOICE_SETTINGS]
+    omni[list(DEFAULT_OMNIVOICE_SETTINGS).index("omnivoice_ref_text")] = load_voice_omnivoice_transcript(config.get("voice_library_id"), model_backend)
+    fish = [values[key] for key in DEFAULT_FISH_S2_SETTINGS]
+    fish[list(DEFAULT_FISH_S2_SETTINGS).index("fish_ref_text")] = load_voice_fish_transcript(config.get("voice_library_id"))
+    cosy = [values[key] for key in DEFAULT_COSYVOICE3_SETTINGS]
+    cosy[0] = load_voice_cosy_transcript(config.get("voice_library_id"))
+    controls = update_model_controls(model_backend)
+    common[0] = expression_control_update(model_backend, values["emotion"])
+    return (*common, *omni, *fish, *cosy, controls[0], controls[1],
+            gr.update(visible=model_backend == "CosyVoice 3"), gr.update(visible=is_index))
+
+
+def reset_selected_model_settings(model_backend: str) -> tuple:
+    switch_model_settings(model_backend)
+    update_user_config(**_model_parameter_defaults(model_backend))
+    return switch_model_settings(model_backend)
 
 
 def reset_advanced_settings() -> tuple:
@@ -2632,12 +3019,40 @@ def _normalise_document_queue(queue_data: list[dict] | None) -> list[dict]:
         item.setdefault("title", Path(str(item.get("filename") or "未命名文档")).stem)
         item.setdefault("filename", str(item["title"]))
         item.setdefault("text", "")
+        item.setdefault("selected_chapters", [])
         item.setdefault("status", "pending")
         item.setdefault("confirmed", item.get("status") == "confirmed")
         item.setdefault("output", "")
         item.setdefault("error", "")
         queue.append(item)
     return queue
+
+
+def _queue_item_is_ebook(item: dict) -> bool:
+    document = item.get("document")
+    return item.get("file_type") in {"EPUB", "MOBI"} or (
+        isinstance(document, dict) and document.get("file_type") in {"EPUB", "MOBI"}
+    )
+
+
+def _document_chapter_choices(document: ImportedDocument) -> list[tuple[str, str]]:
+    return [
+        (
+            f"{index + 1}. {chapter.title} · {chapter.character_count:,} 字",
+            f"{index + 1}. {chapter.title}",
+        )
+        for index, chapter in enumerate(document.chapters)
+    ]
+
+
+def _queue_book_choices(book_sources: list[dict] | None) -> list[tuple[str, str]]:
+    return [
+        (
+            f"{source['title']} · {len(source['document'].get('chapters', []))} 章",
+            str(source["id"]),
+        )
+        for source in book_sources or []
+    ]
 
 
 def _document_queue_choices(queue_data: list[dict] | None) -> list[tuple[str, str]]:
@@ -2657,7 +3072,7 @@ def render_document_queue(queue_data: list[dict] | None) -> str:
     if not queue:
         return """
         <div class="queue-empty">
-          队列为空。一次选择多个文档并加入队列，然后逐份预览、编辑和确认。
+          队列为空。电子书请从已解析书目选章并确认；其他文档可直接预览并确认。
         </div>
         """
     confirmed = sum(bool(item.get("confirmed")) for item in queue)
@@ -2667,6 +3082,11 @@ def render_document_queue(queue_data: list[dict] | None) -> str:
         status_key = str(item.get("status") or "pending")
         status_label = QUEUE_STATUS_LABELS.get(status_key, "待确认")
         count = count_effective_characters(str(item.get("text") or ""))
+        selection = (
+            f" · 已选 {len(item.get('selected_chapters') or [])} 章"
+            if _queue_item_is_ebook(item) and item.get("selected_chapters")
+            else " · 待选章节" if _queue_item_is_ebook(item) else ""
+        )
         detail = ""
         if item.get("output"):
             detail = f'<div class="queue-item-detail">{html.escape(Path(str(item["output"])).name)}</div>'
@@ -2678,7 +3098,7 @@ def render_document_queue(queue_data: list[dict] | None) -> str:
               <span class="queue-order">{index:02d}</span>
               <span class="queue-item-main">
                 <strong>{html.escape(str(item['title']))}</strong>
-                <small>{count:,} 字 · {html.escape(str(item.get('filename') or ''))}</small>
+                <small>{count:,} 字{selection} · {html.escape(str(item.get('filename') or ''))}</small>
                 {detail}
               </span>
               <span class="queue-state">{html.escape(status_label)}</span>
@@ -2688,7 +3108,7 @@ def render_document_queue(queue_data: list[dict] | None) -> str:
     return f"""
     <div class="queue-overview">
       <div class="queue-overview-head">
-        <strong>排队文档 {len(queue)} 份</strong>
+        <strong>排队任务 {len(queue)} 个</strong>
         <span>已确认 {confirmed}/{len(queue)} · 已完成 {completed}/{len(queue)}</span>
       </div>
       <div class="queue-list">{''.join(rows)}</div>
@@ -2699,13 +3119,17 @@ def render_document_queue(queue_data: list[dict] | None) -> str:
 def add_documents_to_queue(
     uploaded_files: list[str] | str | None,
     queue_data: list[dict] | None,
+    book_sources: list[dict] | None = None,
     progress=gr.Progress(),
-) -> tuple[list[dict], gr.Dropdown, str, None, str]:
+) -> tuple[list[dict], list[dict], gr.Dropdown, gr.Dropdown, str, None, str]:
     files = [uploaded_files] if isinstance(uploaded_files, str) else list(uploaded_files or [])
     if not files:
         raise gr.Error("请先选择一个或多个文档。")
     queue = _normalise_document_queue(queue_data)
+    sources = list(book_sources or [])
     added = 0
+    first_queue_id = None
+    last_book_id = None
     failures = []
     for index, uploaded_file in enumerate(files, start=1):
         progress((index - 1, len(files)), desc=f"正在解析第 {index}/{len(files)} 份文档")
@@ -2714,56 +3138,157 @@ def add_documents_to_queue(
         except Exception as exc:
             failures.append(f"{Path(str(uploaded_file)).name}：{exc}")
             continue
-        queue.append(
-            {
-                "id": uuid.uuid4().hex,
+        if document.file_type in {"EPUB", "MOBI"}:
+            last_book_id = uuid.uuid4().hex
+            sources.append({
+                "id": last_book_id,
+                "filename": document.filename,
+                "title": document.title,
+                "document": document.to_dict(),
+            })
+        else:
+            queue_id = uuid.uuid4().hex
+            if first_queue_id is None:
+                first_queue_id = queue_id
+            queue.append({
+                "id": queue_id,
                 "filename": document.filename,
                 "title": document.title,
                 "text": document.text,
-                "document": document.to_dict(),
+                "selected_chapters": [],
                 "status": "pending",
                 "confirmed": False,
                 "output": "",
                 "error": "",
-            }
-        )
+            })
         added += 1
     progress((len(files), len(files)), desc="队列文档解析完成")
     if not added:
         raise gr.Error("所选文档均未能加入队列：" + "；".join(failures))
-    selected_id = str(queue[-added]["id"])
     failure_note = f"｜失败 {len(failures)} 份：{'；'.join(failures)}" if failures else ""
     return (
         queue,
-        gr.Dropdown(choices=_document_queue_choices(queue), value=selected_id),
+        sources,
+        gr.Dropdown(choices=_document_queue_choices(queue), value=None if last_book_id else first_queue_id),
+        gr.Dropdown(choices=_queue_book_choices(sources), value=last_book_id, visible=bool(sources)),
         render_document_queue(queue),
         None,
-        f"已加入 {added} 份文档｜请逐份预览并确认{failure_note}",
+        f"已解析 {added} 份文档｜电子书可逐章加入队列{failure_note}",
     )
 
 
 def preview_queue_document(
     queue_data: list[dict] | None,
     selected_id: str | None,
-) -> tuple[str, str]:
+) -> tuple[str, str, gr.Dropdown, gr.Dropdown]:
     queue = _normalise_document_queue(queue_data)
     item = next((entry for entry in queue if entry["id"] == selected_id), None)
     if item is None:
-        return "", "请从队列中选择一份文档。"
+        return "", "请从队列中选择一份文档。", gr.Dropdown(visible=False), gr.Dropdown(value=None)
     count = count_effective_characters(str(item["text"]))
     status = QUEUE_STATUS_LABELS.get(str(item.get("status")), "待确认")
-    return str(item["text"]), f"正在预览：{item['title']}｜{count:,} 字｜{status}"
+    return str(item["text"]), f"正在预览：{item['title']}｜{count:,} 字｜{status}", gr.Dropdown(visible=False), gr.Dropdown(value=None)
+
+
+def preview_queue_book(
+    book_sources: list[dict] | None,
+    source_id: str | None,
+    queue_data: list[dict] | None,
+) -> tuple[gr.Dropdown, str, str, gr.Dropdown]:
+    source = next((book for book in book_sources or [] if book["id"] == source_id), None)
+    queue_selector = gr.Dropdown(choices=_document_queue_choices(queue_data), value=None)
+    if source is None:
+        return queue_selector, "", "请选择一本已解析的电子书。", gr.Dropdown(visible=False)
+    document = ImportedDocument.from_dict(source["document"])
+    return (
+        queue_selector,
+        "",
+        f"《{source['title']}》已解析；选一章预览并确认，之后可继续选下一章。",
+        gr.Dropdown(choices=_document_chapter_choices(document), value=None, visible=True),
+    )
+
+
+def preview_queue_book_chapter(
+    book_sources: list[dict] | None,
+    source_id: str | None,
+    chapter_id: str | None,
+) -> tuple[str, str]:
+    source = next((book for book in book_sources or [] if book["id"] == source_id), None)
+    if source is None or not chapter_id:
+        return "", "请选择需要加入队列的章节。"
+    try:
+        selected_text = select_document_text(source["document"], [chapter_id])
+    except DocumentImportError as exc:
+        raise gr.Error(str(exc)) from exc
+    count = count_effective_characters(selected_text)
+    message = f"已选择 {chapter_id}｜{count:,} 字；请检查文案并确认。"
+    if count > MAX_SYNTHESIS_CHARACTERS:
+        message += " 当前超过单次合成上限，请减少章节。"
+    return selected_text, message
+
+
+def preview_added_queue_entry(
+    queue_data: list[dict] | None,
+    book_sources: list[dict] | None,
+    selected_id: str | None,
+    source_id: str | None,
+) -> tuple[str, str, gr.Dropdown]:
+    if source_id:
+        _, text, status, selector = preview_queue_book(book_sources, source_id, queue_data)
+    else:
+        text, status, selector, _ = preview_queue_document(queue_data, selected_id)
+    return text, status, selector
 
 
 def confirm_queue_document(
     queue_data: list[dict] | None,
     selected_id: str | None,
     edited_text: str,
-) -> tuple[list[dict], gr.Dropdown, str, str]:
+    book_sources: list[dict] | None = None,
+    source_id: str | None = None,
+    chapter_id: str | None = None,
+) -> tuple[list[dict], gr.Dropdown, str, str, gr.Dropdown, str | dict]:
     queue = _normalise_document_queue(queue_data)
+    source = next((book for book in book_sources or [] if book["id"] == source_id), None)
+    if source is not None:
+        if not chapter_id:
+            raise gr.Error("请先选择电子书需要转换的章节。")
+        document = ImportedDocument.from_dict(source["document"])
+        chapter = next(
+            (chapter for index, chapter in enumerate(document.chapters)
+             if f"{index + 1}. {chapter.title}" == chapter_id),
+            None,
+        )
+        if chapter is None:
+            raise gr.Error("章节选择无效，请重新选择。")
+        cleaned = _validate_synthesis_text(edited_text)
+        chapter_title = chapter.title
+        queue.append({
+            "id": uuid.uuid4().hex,
+            "filename": source["filename"],
+            "file_type": document.file_type,
+            "source_id": source_id,
+            "title": f"{source['title']} · {chapter_title}",
+            "text": cleaned,
+            "selected_chapters": [chapter_id],
+            "status": "confirmed",
+            "confirmed": True,
+            "output": "",
+            "error": "",
+        })
+        return (
+            queue,
+            gr.Dropdown(choices=_document_queue_choices(queue), value=None),
+            render_document_queue(queue),
+            f"已确认并加入队列：{chapter_title}｜可继续选择下一章。",
+            gr.Dropdown(value=None),
+            "",
+        )
     item = next((entry for entry in queue if entry["id"] == selected_id), None)
     if item is None:
         raise gr.Error("请先选择需要确认的队列文档。")
+    if _queue_item_is_ebook(item) and not item.get("selected_chapters"):
+        raise gr.Error("请先选择电子书需要转换的章节。")
     cleaned = _validate_synthesis_text(edited_text)
     item.update(text=cleaned, confirmed=True, status="confirmed", error="", output="")
     return (
@@ -2771,6 +3296,8 @@ def confirm_queue_document(
         gr.Dropdown(choices=_document_queue_choices(queue), value=selected_id),
         render_document_queue(queue),
         f"已确认：{item['title']}｜{count_effective_characters(cleaned):,} 字",
+        gr.skip(),
+        gr.skip(),
     )
 
 
@@ -2900,23 +3427,36 @@ def parse_uploaded_document(
     except Exception as exc:
         raise gr.Error(f"文档解析出现未预期错误：{exc}") from exc
 
-    choices = [
-        (
-            f"{index + 1}. {chapter.title} · {chapter.character_count:,} 字",
-            f"{index + 1}. {chapter.title}",
-        )
-        for index, chapter in enumerate(document.chapters)
-    ]
-    default_values = [choice[1] for choice in choices[: min(3, len(choices))]]
-    preview = document.text[:1200]
-    if len(document.text) > 1200:
-        preview += "\n\n……（预览仅显示前 1,200 字）"
+    choices = _document_chapter_choices(document)
+    is_ebook = document.file_type in {"EPUB", "MOBI"}
+    default_values = [] if is_ebook else [choice[1] for choice in choices[: min(3, len(choices))]]
+    preview = (
+        "请选择章节，预览确认后点击“导入所选章节”。"
+        if is_ebook
+        else preview_document_chapters(document.to_dict(), default_values)
+    )
     return (
         document.to_dict(),
         render_document_summary(document),
         gr.Dropdown(choices=choices, value=default_values, multiselect=True),
         preview,
     )
+
+
+def preview_document_chapters(
+    document_data: dict | None,
+    selected_chapters: list[str] | None,
+) -> str:
+    if not document_data or not selected_chapters:
+        return "请选择章节，预览确认后点击“导入所选章节”。"
+    try:
+        selected_text = select_document_text(document_data, selected_chapters)
+    except DocumentImportError as exc:
+        raise gr.Error(str(exc)) from exc
+    preview = selected_text[:1200]
+    if len(selected_text) > 1200:
+        preview += "\n\n……（预览仅显示所选章节的前 1,200 字）"
+    return preview
 
 
 def load_document_chapters(
@@ -3093,12 +3633,21 @@ def _resolve_emotion_backend(
 def _resolve_model_backend(
     model_backend: str,
     emotion_label: str,
-) -> tuple[IndexTTSv25 | IndexTTSv2 | OmniVoiceTTS | FishS2ProTTS, str | None, str | None, str]:
+) -> tuple[
+    IndexTTSv25 | IndexTTSv2 | OmniVoiceTTS | FishS2ProTTS | CosyVoice3TTS,
+    str | None,
+    str | None,
+    str,
+]:
     """Resolve an explicitly selected backend; never switch models implicitly."""
-    if model_backend == "OmniVoice":
+    if model_backend == VOICESTUDIO_BACKEND:
+        return get_voicestudio_model(), None, None, "VoiceStudio v0.5.2 · OmniVoice 原生 MPS"
+    if model_backend in OMNIVOICE_BACKENDS:
         return get_omnivoice_model(), None, None, "OmniVoice · 本地 MLX"
     if model_backend == "Fish Audio S2 Pro":
         return get_fish_s2_model(), None, None, "Fish Audio S2 Pro · MLX 8-bit"
+    if model_backend == "CosyVoice 3":
+        return get_cosyvoice3_model(), None, None, "CosyVoice 3 · macOS MLX/MPS"
     if model_backend == "IndexTTS 2.0":
         emotion = EMOTIONS.get(emotion_label)
         if emotion is None:
@@ -3107,10 +3656,35 @@ def _resolve_model_backend(
     return get_model(), None, "conditioning_path", "IndexTTS 2.5 · 跟随参考音频"
 
 
+def _apply_omnivoice_expression(
+    expression: str,
+    instruct: str,
+    speed: float,
+    class_temperature: float,
+    position_temperature: float,
+) -> tuple[str, float, float, float]:
+    """Translate one UI expression preset into supported OmniVoice controls."""
+    selected = expression if expression in OMNIVOICE_EXPRESSION_PRESETS else "跟随参考音频"
+    preset = OMNIVOICE_EXPRESSION_PRESETS[selected]
+    custom = str(instruct or "").strip()
+    if selected == "自定义" and not custom:
+        raise ValueError("自定义表达需要填写 OmniVoice 原生风格属性。")
+    effective_instruct = ", ".join(
+        item for item in (str(preset["instruct"]), custom) if item
+    )
+    params = preset["params"]
+    return (
+        effective_instruct,
+        float(params.get("speed", speed)),
+        float(params.get("class_temperature", class_temperature)),
+        float(params.get("position_temperature", position_temperature)),
+    )
+
+
 def _analyze_backend_audio(audio, sample_rate: int, model_backend: str) -> dict:
     """Apply the spectral guard calibrated for each backend's codec/sample rate."""
     report = analyze_audio_quality(audio, sample_rate)
-    if model_backend not in {"OmniVoice", "Fish Audio S2 Pro"}:
+    if model_backend not in {*OMNIVOICE_BACKENDS, "Fish Audio S2 Pro", "CosyVoice 3"}:
         return report
     high_frequency_issue = "检测到异常高频能量，可能存在啸叫或金属音"
     # OmniVoice's 24 kHz audio tokenizer naturally retains more 7–12 kHz
@@ -3164,8 +3738,13 @@ def _synthesize_unlocked(
     fish_max_tokens: float = 1024,
     fish_chunk_length: float = 300,
     fish_ref_audio_max_duration_s: float = 15.0,
+    cosy_ref_text: str = "",
+    cosy_precision: str = "fp16",
+    cosy_nfe: float = 10,
+    cosy_ref_audio_max_duration_s: float = 10.0,
     progress=gr.Progress(),
     batch_ready_callback: Callable[[str], None] | None = None,
+    persist_output_settings: bool = True,
 ) -> tuple[str | None, str, str]:
     """Generate audio in the selected format and output directory."""
     cleaned_text = _validate_synthesis_text(text)
@@ -3174,8 +3753,8 @@ def _synthesize_unlocked(
     # former global current_voice cache, which may belong to a previously used voice.
     library_entry = _load_voice_entry(voice_library_id)
     voice_required = (
-        model_backend not in {"OmniVoice", "Fish Audio S2 Pro"}
-        or (model_backend == "OmniVoice" and omnivoice_mode == "clone")
+        model_backend not in {*OMNIVOICE_BACKENDS, "Fish Audio S2 Pro"}
+        or (model_backend in OMNIVOICE_BACKENDS and omnivoice_mode == "clone")
         or (model_backend == "Fish Audio S2 Pro" and fish_mode == "clone")
     )
     if library_entry is None and voice_required:
@@ -3193,10 +3772,11 @@ def _synthesize_unlocked(
     basename = _available_audio_basename(selected_directory, cleaned_text, selected_format)
     final_path = selected_directory / f"{basename}.{selected_format}"
     output_path = final_path if selected_format == "wav" else selected_directory / f"{basename}.wav"
-    update_user_config(
-        output_format=selected_format,
-        output_directory=str(selected_directory),
-    )
+    if persist_output_settings:
+        update_user_config(
+            output_format=selected_format,
+            output_directory=str(selected_directory),
+        )
 
     with _generation_control_lock:
         _generation_cancelled.clear()
@@ -3210,6 +3790,10 @@ def _synthesize_unlocked(
     speed_optimization_used = False
     completed_batches: list[Path] = []
     batch_directory = selected_directory / f".{basename}.parts"
+    saved_speed = speed
+    saved_omnivoice_instruct = omnivoice_instruct
+    saved_omnivoice_class_temperature = omnivoice_class_temperature
+    saved_omnivoice_position_temperature = omnivoice_position_temperature
 
     def preserve_partial_audio() -> Path | None:
         partial_path = output_path.with_name(f"{output_path.stem}.partial.wav")
@@ -3230,11 +3814,27 @@ def _synthesize_unlocked(
         model, emotion, conditioning_key, backend_label = _resolve_model_backend(
             model_backend, emotion_label
         )
+        if model_backend in OMNIVOICE_BACKENDS:
+            (
+                omnivoice_instruct,
+                speed,
+                omnivoice_class_temperature,
+                omnivoice_position_temperature,
+            ) = _apply_omnivoice_expression(
+                emotion_label,
+                omnivoice_instruct,
+                speed,
+                omnivoice_class_temperature,
+                omnivoice_position_temperature,
+            )
+            backend_label = f"{backend_label} · {emotion_label}"
         use_v25_backend = model_backend == "IndexTTS 2.5"
-        if model_backend in {"OmniVoice", "Fish Audio S2 Pro"}:
+        if model_backend in {*OMNIVOICE_BACKENDS, "Fish Audio S2 Pro", "CosyVoice 3"}:
             # Both external MLX backends own their reference resampling. Feeding
             # the normalized 22.05 kHz IndexTTS preview loses speaker detail.
-            clone_mode = omnivoice_mode if model_backend == "OmniVoice" else fish_mode
+            clone_mode = omnivoice_mode if model_backend in OMNIVOICE_BACKENDS else fish_mode
+            if model_backend == "CosyVoice 3":
+                clone_mode = "clone"
             reference = Path(reference_audio) if library_entry and clone_mode == "clone" else None
         else:
             assert library_entry is not None and conditioning_key is not None
@@ -3281,7 +3881,7 @@ def _synthesize_unlocked(
             model_backend,
             emotion_label,
             emotion_strength,
-            speed,
+            saved_speed,
             seed,
             interval_silence,
             segment_overlap_ms,
@@ -3301,12 +3901,12 @@ def _synthesize_unlocked(
             omnivoice_mode,
             omnivoice_language,
             omnivoice_ref_text,
-            omnivoice_instruct,
+            saved_omnivoice_instruct,
             omnivoice_duration_s,
             omnivoice_num_steps,
             omnivoice_guidance_scale,
-            omnivoice_class_temperature,
-            omnivoice_position_temperature,
+            saved_omnivoice_class_temperature,
+            saved_omnivoice_position_temperature,
             omnivoice_layer_penalty_factor,
             omnivoice_t_shift,
             omnivoice_ref_audio_max_duration_s,
@@ -3322,7 +3922,10 @@ def _synthesize_unlocked(
             fish_chunk_length,
             fish_ref_audio_max_duration_s,
         )
-        if model_backend not in {"OmniVoice", "Fish Audio S2 Pro"}:
+        save_cosyvoice3_settings(
+            cosy_ref_text, cosy_precision, cosy_nfe, cosy_ref_audio_max_duration_s,
+        )
+        if model_backend not in {*OMNIVOICE_BACKENDS, "Fish Audio S2 Pro", "CosyVoice 3"}:
             # IndexTTS caches are keyed by per-voice conditioning files. Keep
             # external-model prompt caches so reference encoding/ASR runs once.
             model.cache = {}
@@ -3408,13 +4011,13 @@ def _synthesize_unlocked(
                 ),
                 verbose=True,
             )
-            if model_backend == "OmniVoice":
+            if model_backend in OMNIVOICE_BACKENDS:
                 generate_kwargs.update(
                     omnivoice_mode=omnivoice_mode,
                     language=omnivoice_language,
                     ref_text=(
                         omnivoice_ref_text
-                        or (str(library_entry.get("omnivoice_ref_text") or "") if library_entry else "")
+                        or (str(library_entry.get(_omnivoice_transcript_key(model_backend)) or "") if library_entry else "")
                     ),
                     instruct=omnivoice_instruct,
                     duration_s=float(omnivoice_duration_s),
@@ -3441,18 +4044,28 @@ def _synthesize_unlocked(
                     chunk_length=int(fish_chunk_length),
                     ref_audio_max_duration_s=float(fish_ref_audio_max_duration_s),
                 )
+            elif model_backend == "CosyVoice 3":
+                generate_kwargs.update(
+                    cosy_ref_text=(
+                        cosy_ref_text
+                        or (str(library_entry.get("cosy_ref_text") or "") if library_entry else "")
+                    ),
+                    cosy_precision=cosy_precision,
+                    cosy_nfe=int(cosy_nfe),
+                    cosy_ref_audio_max_duration_s=float(cosy_ref_audio_max_duration_s),
+                )
             generated_audio = model.generate(**generate_kwargs)
             if (
-                model_backend == "OmniVoice"
+                model_backend in OMNIVOICE_BACKENDS
                 and omnivoice_mode == "clone"
                 and library_entry
                 and getattr(model, "last_reference_transcript", "")
-                and str(library_entry.get("omnivoice_ref_text") or "")
+                and str(library_entry.get(_omnivoice_transcript_key(model_backend)) or "")
                 != str(model.last_reference_transcript)
             ):
                 library_entry = _update_voice_metadata(
                     str(library_entry["id"]),
-                    omnivoice_ref_text=str(model.last_reference_transcript),
+                    **{_omnivoice_transcript_key(model_backend): str(model.last_reference_transcript)},
                 ) or library_entry
             if (
                 model_backend == "Fish Audio S2 Pro"
@@ -3465,6 +4078,17 @@ def _synthesize_unlocked(
                 library_entry = _update_voice_metadata(
                     str(library_entry["id"]),
                     fish_ref_text=str(model.last_reference_transcript),
+                ) or library_entry
+            if (
+                model_backend == "CosyVoice 3"
+                and library_entry
+                and getattr(model, "last_reference_transcript", "")
+                and str(library_entry.get("cosy_ref_text") or "")
+                != str(model.last_reference_transcript)
+            ):
+                library_entry = _update_voice_metadata(
+                    str(library_entry["id"]),
+                    cosy_ref_text=str(model.last_reference_transcript),
                 ) or library_entry
             job_sample_rate = int(getattr(model, "sample_rate", VOICE_SAMPLE_RATE))
             quality_report = _analyze_backend_audio(generated_audio, job_sample_rate, model_backend)
@@ -3495,6 +4119,9 @@ def _synthesize_unlocked(
                 message=f"全部 {len(prepared_batches)} 个批次已通过音质检查，正在合并音频",
             )
         _concatenate_wav_batches(completed_batches, output_path, int(interval_silence))
+        fish_gain_db = 0.0
+        if model_backend == "Fish Audio S2 Pro":
+            fish_gain_db = boost_wav(output_path)
     except GenerationCancelled:
         _finish_generation_progress("cancelled", "任务已终止，已完成片段已尽量保留")
         partial_path = preserve_partial_audio()
@@ -3538,9 +4165,9 @@ def _synthesize_unlocked(
 
     with _generation_progress_lock:
         elapsed = _active_elapsed(_generation_progress_state)
-    if model_backend == "OmniVoice" and omnivoice_mode == "design":
+    if model_backend in OMNIVOICE_BACKENDS and omnivoice_mode == "design":
         reference_note = "OmniVoice 音色设计"
-    elif model_backend == "OmniVoice" and omnivoice_mode == "auto":
+    elif model_backend in OMNIVOICE_BACKENDS and omnivoice_mode == "auto":
         reference_note = "OmniVoice 自动音色"
     elif model_backend == "Fish Audio S2 Pro" and fish_mode == "auto":
         reference_note = "Fish S2 Pro 自动音色"
@@ -3555,6 +4182,10 @@ def _synthesize_unlocked(
         fallback_note = ""
     speed_note = "｜2.5 长文已自动使用平衡扩散步数" if speed_optimization_used else ""
     quality_note = ""
+    if model_backend == "Fish Audio S2 Pro":
+        speed_note = f"｜成品音量 +{fish_gain_db:.1f} dB（真实峰值保护）"
+    if model_backend == "CosyVoice 3":
+        speed_note = f"｜模型推理 RTF {model.last_generation_rtf:.2f}（越小越快）"
     if quality_reports:
         high_frequency_mean = sum(
             report["high_frequency_mean"] for report in quality_reports
@@ -3592,6 +4223,186 @@ def synthesize(*args, **kwargs) -> tuple[str | None, str, str]:
     finally:
         _stop_sleep_prevention(sleep_prevention)
         _synthesis_job_lock.release()
+
+
+_SYNTHESIS_ARGUMENT_NAMES = (
+    "text", "voice_library_id", "model_backend", "emotion_label",
+    "emotion_strength", "speed", "seed", "interval_silence",
+    "segment_overlap_ms", "max_text_tokens", "temperature",
+    "diffusion_steps", "max_mel_tokens", "top_p", "top_k",
+    "repetition_penalty", "cfg_rate", "fast_vocoder",
+    "omnivoice_mode", "omnivoice_language", "omnivoice_ref_text",
+    "omnivoice_instruct", "omnivoice_duration_s", "omnivoice_num_steps",
+    "omnivoice_guidance_scale", "omnivoice_class_temperature",
+    "omnivoice_position_temperature", "omnivoice_layer_penalty_factor",
+    "omnivoice_t_shift", "omnivoice_ref_audio_max_duration_s",
+    "output_format", "output_directory", "fish_mode", "fish_ref_text",
+    "fish_instruct", "fish_temperature", "fish_top_p", "fish_top_k",
+    "fish_max_tokens", "fish_chunk_length", "fish_ref_audio_max_duration_s",
+    "cosy_ref_text", "cosy_precision", "cosy_nfe", "cosy_ref_audio_max_duration_s",
+)
+
+
+def _synthesis_kwargs_from_args(args: tuple) -> dict:
+    return dict(zip(_SYNTHESIS_ARGUMENT_NAMES, args, strict=True))
+
+
+def _validate_multi_voice_selection(
+    voice_ids: list[str] | None,
+    model_backend: str,
+    omnivoice_mode: str,
+    fish_mode: str,
+) -> list[str]:
+    selected_voices = list(dict.fromkeys(str(item) for item in (voice_ids or []) if item))
+    if len(selected_voices) < 2:
+        raise gr.Error("多人朗读至少需要选择两种音色。")
+    missing = [voice_id for voice_id in selected_voices if _load_voice_entry(voice_id) is None]
+    if missing:
+        raise gr.Error("多人朗读中包含已删除或不存在的音色，请重新选择。")
+    if model_backend in OMNIVOICE_BACKENDS and omnivoice_mode != "clone":
+        raise gr.Error("多人朗读需要将 OmniVoice 工作模式设为“克隆已选音色”。")
+    if model_backend == "Fish Audio S2 Pro" and fish_mode != "clone":
+        raise gr.Error("多人朗读需要将 Fish S2 Pro 工作模式设为“克隆已选音色”。")
+    return selected_voices
+
+
+def synthesize_multi_voice(
+    text: str,
+    voice_ids: list[str] | None,
+    split_mode: str,
+    switch_every: float,
+    synthesis_kwargs: dict,
+    batch_ready_callback: Callable[[str], None] | None = None,
+    job_lock_held: bool = False,
+) -> tuple[str | None, str, str]:
+    """Generate assigned narration units and merge them into one delivery file."""
+    cleaned_text = _validate_synthesis_text(text)
+    selected_voices = _validate_multi_voice_selection(
+        voice_ids,
+        str(synthesis_kwargs["model_backend"]),
+        str(synthesis_kwargs.get("omnivoice_mode") or ""),
+        str(synthesis_kwargs.get("fish_mode") or ""),
+    )
+    units = split_narration_units(cleaned_text, split_mode)
+    assignments = assign_voices_to_units(units, selected_voices, int(switch_every or 1))
+    if not assignments:
+        raise gr.Error("没有识别到可朗读的段落或句子。")
+
+    selected_format = _normalise_output_format(str(synthesis_kwargs.get("output_format") or "mp3"))
+    selected_directory = _resolve_output_directory(str(synthesis_kwargs.get("output_directory") or OUTPUT_DIR))
+    basename = _available_audio_basename(selected_directory, cleaned_text, selected_format)
+    final_path = selected_directory / f"{basename}.{selected_format}"
+    merged_wav = final_path if selected_format == "wav" else selected_directory / f"{basename}.wav"
+    temporary_directory = Path(tempfile.mkdtemp(prefix=".multi_voice_", dir=selected_directory))
+    generated_parts: list[Path] = []
+    original_config = read_user_config()
+    cancelled = False
+    completed_delivery = False
+    if not job_lock_held and not _synthesis_job_lock.acquire(blocking=False):
+        shutil.rmtree(temporary_directory, ignore_errors=True)
+        raise gr.Error("已有音频合成任务正在后台运行，请先等待或终止当前任务。")
+    sleep_prevention = _start_sleep_prevention() if not job_lock_held else None
+    try:
+        for index, (unit, voice_id) in enumerate(assignments, start=1):
+            if job_lock_held and _document_queue_cancelled.is_set():
+                cancelled = True
+                break
+            entry = _load_voice_entry(voice_id)
+            assert entry is not None
+            with _generation_progress_lock:
+                _generation_progress_state.update(
+                    state="running",
+                    current=index - 1,
+                    total=len(assignments),
+                    message=(
+                        f"多人朗读 {index}/{len(assignments)}｜"
+                        f"正在使用音色：{entry.get('name') or voice_id[:8]}"
+                    ),
+                )
+            part_kwargs = dict(synthesis_kwargs)
+            part_kwargs.update(
+                text=unit,
+                voice_library_id=voice_id,
+                output_format="wav",
+                output_directory=str(temporary_directory),
+                # Each voice owns a separate cached transcript. A transcript
+                # from the main selector must never leak into another voice.
+                omnivoice_ref_text="",
+                fish_ref_text="",
+                cosy_ref_text="",
+                progress=lambda *_args, **_kwargs: None,
+                batch_ready_callback=None,
+                persist_output_settings=False,
+            )
+            part_path, part_status, _location = _synthesize_unlocked(**part_kwargs)
+            if part_path and Path(part_path).is_file():
+                generated_parts.append(Path(part_path))
+                if batch_ready_callback is not None:
+                    batch_ready_callback(str(part_path))
+            if str(part_status).startswith("任务已终止"):
+                cancelled = True
+                break
+            with _generation_progress_lock:
+                _generation_progress_state.update(
+                    state="running",
+                    current=index,
+                    total=len(assignments),
+                    message=f"多人朗读已完成 {index}/{len(assignments)} 个单元",
+                )
+
+        if not generated_parts:
+            return None, "多人朗读已终止｜尚未生成可保留的音频。", ""
+        _concatenate_wav_batches(
+            generated_parts,
+            merged_wav,
+            int(synthesis_kwargs.get("interval_silence") or 0),
+        )
+        if selected_format != "wav":
+            _convert_output_audio(merged_wav, final_path, selected_format)
+            merged_wav.unlink(missing_ok=True)
+        voice_names = [
+            str((_load_voice_entry(voice_id) or {}).get("name") or voice_id[:8])
+            for voice_id in selected_voices
+        ]
+        if cancelled:
+            status = (
+                f"多人朗读已安全终止｜已合并 {len(generated_parts)}/{len(assignments)} 个单元｜"
+                f"格式 {selected_format.upper()}｜已保存至 {final_path}"
+            )
+            state = "cancelled"
+        else:
+            status = (
+                f"多人朗读生成完成｜{len(assignments)} 个单元｜"
+                f"{len(selected_voices)} 种音色：{'、'.join(voice_names)}｜"
+                f"格式 {selected_format.upper()}｜已保存至 {final_path}"
+            )
+            state = "completed"
+        with _generation_progress_lock:
+            _generation_progress_state.update(
+                state=state,
+                current=len(generated_parts),
+                total=len(assignments),
+                message=status,
+                finished_elapsed=_active_elapsed(_generation_progress_state),
+            )
+        completed_delivery = True
+        return str(final_path), status, str(final_path)
+    except Exception:
+        final_path.unlink(missing_ok=True)
+        merged_wav.unlink(missing_ok=True)
+        raise
+    finally:
+        original_entry = _load_voice_entry(original_config.get("voice_library_id"))
+        _activate_voice_entry(original_entry, track_usage=False)
+        update_user_config(
+            output_format=selected_format,
+            output_directory=str(selected_directory),
+        )
+        if not job_lock_held:
+            _stop_sleep_prevention(sleep_prevention)
+            _synthesis_job_lock.release()
+        if batch_ready_callback is None or not completed_delivery:
+            shutil.rmtree(temporary_directory, ignore_errors=True)
 
 
 def _write_document_queue_manifest(
@@ -3668,6 +4479,14 @@ def synthesize_document_queue_stream(
     fish_max_tokens: float = 1024,
     fish_chunk_length: float = 300,
     fish_ref_audio_max_duration_s: float = 15.0,
+    cosy_ref_text: str = "",
+    cosy_precision: str = "fp16",
+    cosy_nfe: float = 10,
+    cosy_ref_audio_max_duration_s: float = 10.0,
+    multi_voice_enabled: bool = False,
+    multi_voice_ids: list[str] | None = None,
+    multi_voice_split_mode: str = "paragraph",
+    multi_voice_switch_every: float = 1,
 ):
     """Generate every confirmed document sequentially in one protected job."""
     queue = _normalise_document_queue(queue_data)
@@ -3676,6 +4495,12 @@ def synthesize_document_queue_stream(
     unconfirmed = [str(item["title"]) for item in queue if not item.get("confirmed")]
     if unconfirmed:
         raise gr.Error("以下文档尚未确认：" + "、".join(unconfirmed))
+    if any(_queue_item_is_ebook(item) and not item.get("selected_chapters") for item in queue):
+        raise gr.Error("队列中有电子书尚未选择章节，请先选章并确认。")
+    if multi_voice_enabled:
+        _validate_multi_voice_selection(
+            multi_voice_ids, model_backend, omnivoice_mode, fish_mode
+        )
     for item in queue:
         _validate_synthesis_text(str(item.get("text") or ""))
         item.update(status="confirmed", output="", error="")
@@ -3732,6 +4557,10 @@ def synthesize_document_queue_stream(
         fish_max_tokens,
         fish_chunk_length,
         fish_ref_audio_max_duration_s,
+        cosy_ref_text,
+        cosy_precision,
+        cosy_nfe,
+        cosy_ref_audio_max_duration_s,
     )
 
     def publish(message: str, *, audio: str | None = None, location: str | None = None) -> None:
@@ -3762,11 +4591,24 @@ def synthesize_document_queue_stream(
                 publish(f"队列 {index}/{len(queue)}｜正在转换：{item['title']}")
                 _write_document_queue_manifest(queue, output_directory, run_id, "running")
                 try:
-                    audio_path, item_status, location = _synthesize_unlocked(
-                        str(item["text"]),
-                        *synthesis_args,
-                        progress=lambda *_args, **_kwargs: None,
-                    )
+                    if multi_voice_enabled:
+                        synthesis_kwargs = _synthesis_kwargs_from_args(
+                            (str(item["text"]), *synthesis_args)
+                        )
+                        audio_path, item_status, location = synthesize_multi_voice(
+                            str(item["text"]),
+                            multi_voice_ids,
+                            multi_voice_split_mode,
+                            multi_voice_switch_every,
+                            synthesis_kwargs,
+                            job_lock_held=True,
+                        )
+                    else:
+                        audio_path, item_status, location = _synthesize_unlocked(
+                            str(item["text"]),
+                            *synthesis_args,
+                            progress=lambda *_args, **_kwargs: None,
+                        )
                 except BaseException as exc:
                     if _document_queue_cancelled.is_set():
                         item.update(status="stopped", error="用户终止队列")
@@ -3824,6 +4666,15 @@ def synthesize_document_queue_stream(
     worker = threading.Thread(target=run_queue, name="indextts-document-queue", daemon=True)
     worker.start()
     last_version = -1
+    playback_paths: dict[str, str] = {}
+
+    def playable_result(audio: str | None):
+        if not audio:
+            return gr.skip()
+        if audio not in playback_paths:
+            playback_paths[audio] = _playable_audio_path(audio) or audio
+        return playback_paths[audio]
+
     while not finished.wait(0.5):
         with state_lock:
             version = int(runtime["version"])
@@ -3834,7 +4685,7 @@ def synthesize_document_queue_stream(
         if version == last_version:
             yield gr.skip(), render_document_queue(snapshot), gr.skip(), message, render_generation_progress(), gr.skip()
         else:
-            yield snapshot, render_document_queue(snapshot), audio or gr.skip(), message, render_generation_progress(), location or gr.skip()
+            yield snapshot, render_document_queue(snapshot), playable_result(audio), message, render_generation_progress(), location or gr.skip()
             last_version = version
 
     with state_lock:
@@ -3845,7 +4696,7 @@ def synthesize_document_queue_stream(
         location = str(runtime["location"])
     if error is not None:
         raise error
-    yield snapshot, render_document_queue(snapshot), audio or gr.skip(), message, render_generation_progress(), location or gr.skip()
+    yield snapshot, render_document_queue(snapshot), playable_result(audio), message, render_generation_progress(), location or gr.skip()
 
 
 def synthesize_stream(
@@ -3891,6 +4742,14 @@ def synthesize_stream(
     fish_max_tokens: float = 1024,
     fish_chunk_length: float = 300,
     fish_ref_audio_max_duration_s: float = 15.0,
+    cosy_ref_text: str = "",
+    cosy_precision: str = "fp16",
+    cosy_nfe: float = 10,
+    cosy_ref_audio_max_duration_s: float = 10.0,
+    multi_voice_enabled: bool = False,
+    multi_voice_ids: list[str] | None = None,
+    multi_voice_split_mode: str = "paragraph",
+    multi_voice_switch_every: float = 1,
 ):
     """Stream progress and optionally autoplay each completed audio batch."""
     finished = threading.Event()
@@ -3905,7 +4764,7 @@ def synthesize_stream(
 
     def run_generation() -> None:
         try:
-            result["value"] = synthesize(
+            single_args = (
                 text,
                 voice_library_id,
                 model_backend,
@@ -3947,9 +4806,28 @@ def synthesize_stream(
                 fish_max_tokens,
                 fish_chunk_length,
                 fish_ref_audio_max_duration_s,
-                progress=lambda *_args, **_kwargs: None,
-                batch_ready_callback=(publish_completed_batch if live_playback else None),
+                cosy_ref_text,
+                cosy_precision,
+                cosy_nfe,
+                cosy_ref_audio_max_duration_s,
             )
+            callback = publish_completed_batch if live_playback else None
+            if multi_voice_enabled:
+                synthesis_kwargs = _synthesis_kwargs_from_args(single_args)
+                result["value"] = synthesize_multi_voice(
+                    text,
+                    multi_voice_ids,
+                    multi_voice_split_mode,
+                    multi_voice_switch_every,
+                    synthesis_kwargs,
+                    batch_ready_callback=callback,
+                )
+            else:
+                result["value"] = synthesize(
+                    *single_args,
+                    progress=lambda *_args, **_kwargs: None,
+                    batch_ready_callback=callback,
+                )
         except BaseException as exc:
             result["error"] = exc
         finally:
@@ -3984,7 +4862,7 @@ def synthesize_stream(
                 if preview_path and preview_version > published_preview_version:
                     live_batch_directory = Path(str(preview_path)).parent
                     preview_update = gr.Audio(
-                        value=str(preview_path),
+                        value=_playable_audio_path(str(preview_path)),
                         visible=True,
                         autoplay=True,
                     )
@@ -4004,14 +4882,14 @@ def synthesize_stream(
                 live_batch_directory = Path(str(preview_path)).parent
             if preview_path and preview_version > published_preview_version:
                 preview_update = gr.Audio(
-                    value=str(preview_path),
+                    value=_playable_audio_path(str(preview_path)),
                     visible=True,
                     autoplay=True,
                 )
         else:
             preview_update = gr.Audio(value=None, visible=False, autoplay=False)
         yield (
-            audio_path,
+            _playable_audio_path(audio_path),
             final_status,
             render_generation_progress(),
             output_location,
@@ -4025,12 +4903,15 @@ def synthesize_stream(
 def build_ui() -> gr.Blocks:
     initial_config = read_user_config()
     initial_omnivoice_ref_text = load_voice_omnivoice_transcript(
-        initial_config.get("voice_library_id")
+        initial_config.get("voice_library_id"), initial_config["model_backend"]
     )
     initial_fish_ref_text = load_voice_fish_transcript(initial_config.get("voice_library_id"))
+    initial_cosy_ref_text = load_voice_cosy_transcript(initial_config.get("voice_library_id"))
     with gr.Blocks(title=f"IndexTTS 2.5 专业语音工作台 · v{APP_VERSION}") as demo:
         document_state = gr.State(value=None)
         document_queue_state = gr.State(value=[])
+        queue_book_sources = gr.State(value=[])
+        text_cleanup_undo_state = gr.State(value="")
         with gr.Sidebar(
             label="设置",
             open=False,
@@ -4040,9 +4921,9 @@ def build_ui() -> gr.Blocks:
         ):
             gr.HTML('<div class="settings-title">合成设置</div>')
             gr.HTML(
-                '<div class="settings-description">IndexTTS 2.5 默认跟随参考人声的音色和表达。先选择速度档位，再按需微调。</div>'
+                '<div class="settings-description">每个模型分别保存参数；下方仅显示当前模型适用的设置。</div>'
             )
-            with gr.Row(elem_classes=["preset-row"]):
+            with gr.Row(elem_classes=["preset-row"], visible=initial_config["model_backend"].startswith("IndexTTS")) as index_presets:
                 fast_preset = gr.Button("极速预览", elem_classes=["preset-button"])
                 balanced_preset = gr.Button("平衡模式", elem_classes=["preset-button"])
                 quality_preset = gr.Button("高质量", elem_classes=["preset-button"])
@@ -4084,7 +4965,7 @@ def build_ui() -> gr.Blocks:
             diffusion_steps = gr.Number(
                 label="扩散步数",
                 info="步数越高细节可能越丰富，但生成速度会更慢。",
-                value=25,
+                value=initial_config["diffusion_steps"],
                 minimum=10,
                 maximum=50,
                 step=1,
@@ -4156,40 +5037,96 @@ def build_ui() -> gr.Blocks:
               <div class="app-badges">
                 <span class="app-badge">Apple MLX</span>
                 <span class="app-badge">离线可用</span>
-                <span class="app-badge">22.05 kHz</span>
-                <button id="about-open" class="about-trigger" type="button">关于 / v0.3.4</button>
+                <span class="app-badge">OmniVoice 24 kHz</span>
+                <button id="about-open" class="about-trigger" type="button">关于 / v0.5.4</button>
               </div>
             </header>
 
             <div id="about-modal" class="about-modal" aria-hidden="true">
               <section class="about-card" role="dialog" aria-modal="true" aria-labelledby="about-title">
                 <div class="about-card-head">
-                  <h2 id="about-title">IndexTTS WebUI · v0.3.4</h2>
+                  <h2 id="about-title">IndexTTS WebUI · v0.5.4</h2>
                   <button id="about-close" class="about-close" type="button" aria-label="关闭">×</button>
                 </div>
                 <div class="about-card-body">
                   <div class="about-current">
-                    <strong>当前应用版本：v0.3.4</strong><br>
-                    默认使用 IndexTTS 2.5，可切换 IndexTTS 2.0、OmniVoice 与 Fish Audio S2 Pro。
-                    四个大模型按需分时加载，避免同时占用统一内存。
+                    <strong>当前应用版本：v0.5.4（2026-09-30，夜间队列支持多音色）</strong><br>
+                    默认使用 OmniVoice、默认输出 MP3；六个引擎按需分时加载，避免同时占用统一内存。
                   </div>
                   <table class="about-table">
                     <thead><tr><th>组件</th><th>当前版本 / 规格</th><th>状态与作用</th></tr></thead>
                     <tbody>
-                      <tr><td>IndexTTS 主模型</td><td><strong>2.5</strong></td><td><span class="version-installed">已安装、正在使用</span>；负责音色克隆、多语种语音生成和语速控制。</td></tr>
+                      <tr><td>IndexTTS 主模型</td><td><strong>2.5</strong></td><td><span class="version-installed">已安装，可在模型库选择</span>；负责音色克隆、多语种语音生成和语速控制。</td></tr>
                       <tr><td>IndexTTS 2.0</td><td><strong>2.0</strong></td><td>在模型选择器中切换后，可使用平静、高兴、悲伤等具体情绪。</td></tr>
                       <tr><td>OmniVoice</td><td><strong>MLX bfloat16</strong></td><td>本地 24 kHz 多语种合成、音色克隆与文字音色设计；CC-BY-NC，非小米官方 MiMo。</td></tr>
                       <tr><td>Fish Audio S2 Pro</td><td><strong>MLX 8-bit · 44.1 kHz</strong></td><td>Built with Fish Audio。约 5B 参数，支持音色克隆、自动音色、多说话人和文本内情绪标签；Fish Audio Research License，仅限研究及非商业使用。</td></tr>
+                      <tr><td>CosyVoice 3</td><td><strong>0.5B · 24 kHz</strong></td><td>独立本机运行时，支持已有参考音色的零样本克隆。</td></tr>
+                      <tr><td>VoiceStudio v0.5.2</td><td><strong>OmniVoice 原生 · 24 kHz</strong></td><td>独立子进程运行 PyTorch/MPS；克隆、音色设计与自动音色。参数与 MLX 入口分别保存。</td></tr>
                       <tr><td>GPT 声学 Token 模型</td><td>GPT 2.5、持久化 8-bit</td><td>自回归解码加速；音色与声码器等保真关键模块保持 FP32。</td></tr>
                       <tr><td>S2Mel</td><td>IndexTTS 2.5 CFM / DiT</td><td>将语音 Token 转换为 Mel 频谱，保持 FP32 以避免细节损失。</td></tr>
                       <tr><td>BigVGAN 声码器</td><td>2.5 内置高保真权重、22.05 kHz</td><td>将 Mel 频谱转成 WAV 波形；保持 FP32，不使用旧版快速降质路径。</td></tr>
                       <tr><td>MLX 推理引擎</td><td>0.31.1</td><td>运行于 Apple Silicon 统一内存和 GPU。</td></tr>
-                      <tr><td>PyTorch</td><td>2.10.0（仅旧 2.0 回退）</td><td>2.5 主路径为 Torch-free MLX，不调用 PyTorch。</td></tr>
+                      <tr><td>PyTorch</td><td>2.10.0（VoiceStudio / 旧 2.0 回退）</td><td>VoiceStudio 使用独立 PyTorch/MPS 子进程；IndexTTS 2.5 主路径为 Torch-free MLX。</td></tr>
                       <tr><td>文档导入 / OCR</td><td>Calibre 9.13.0 / Tesseract 5</td><td>本机读取 TXT、MD、DOC、DOCX、PDF、EPUB、MOBI；扫描 PDF 使用本机中文 OCR。</td></tr>
-                      <tr><td>WebUI</td><td><strong>mlx-indextts 0.3.4</strong> + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持四模型切换、独立参数、队列、长文分段、暂停、终止、实时试听与音质检查。</td></tr>
+                      <tr><td>WebUI</td><td><strong>mlx-indextts 0.5.4</strong> + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持文本清洗、多人轮换朗读、六个引擎入口、逐章导入、队列、长文分段、暂停、终止、实时试听与音质检查。</td></tr>
                     </tbody>
                   </table>
                   <div class="about-changelog-title">版本变更日志</div>
+                  <section class="about-release">
+                    <div class="about-release-head"><strong>v0.5.4</strong><span>2026-09-30 · 夜间队列多音色与文档输出优化</span></div>
+                    <ul>
+                      <li>夜间多文档队列沿用多音色轮换设置，每份文档分别生成一个音频文件，并保留暂停、终止和逐份进度。</li>
+                      <li>EPUB/MOBI 解析一次后，可逐章预览、确认并继续添加下一章；单文档也可只导入所选章节。</li>
+                      <li>修复生成结果播放、下载和保存位置的错误；可指定输出文件夹，文件夹设置采用紧凑横向布局。</li>
+                      <li>新增 CosyVoice 3 与 VoiceStudio 原生 OmniVoice 入口；外部模型和独立运行时按需安装。</li>
+                    </ul>
+                  </section>
+                  <section class="about-release">
+                    <div class="about-release-head"><strong>v0.5.3</strong><span>2026-09-23 · 移除不适合本机的 CPU 合成后端</span></div>
+                    <ul>
+                      <li>删除该后端的模型选择项、专属参数区、设置事件和推理调度代码。</li>
+                      <li>删除独立运行环境、权重、上游源码、适配器、工作进程、测试样本和日志，释放约 5.2 GB。</li>
+                      <li>自动清理旧配置中的失效模型选项及参数，回退到默认 OmniVoice。</li>
+                    </ul>
+                  </section>
+                  <section class="about-release">
+                    <div class="about-release-head"><strong>v0.5.2</strong><span>2026-09-23 · OmniVoice MLX 克隆音质优化</span></div>
+                    <ul>
+                      <li>参考音频真正限制为官方建议的 3–10 秒；超过 10 秒时在低能量边界安全截取，避免长提示降低声纹稳定性。</li>
+                      <li>截取后由本地 Qwen3-ASR 重新识别实际送入模型的同一段波形，修复参考文字与音频错位造成的失真和相似度下降。</li>
+                      <li>增加去直流、首尾静音清理和 10 毫秒淡入淡出；保持原生 24 kHz，不做虚假升采样或破坏音色的均衡处理。</li>
+                      <li>修正当前“孔乙己-女生”参考原文中重复的“傍晚”一词，并升级参考提示缓存版本。</li>
+                    </ul>
+                  </section>
+                  <section class="about-release">
+                    <div class="about-release-head"><strong>v0.4.2</strong><span>2026-09-23 · 文本清洗、多人轮换朗读与新默认值</span></div>
+                    <ul>
+                      <li>新增一键文本格式清洗与撤销：删除纯编号括号、脚注、网址、Markdown、表情和装饰符号，保留日期、金额、百分比及正文。</li>
+                      <li>新增按自然段、非空行或句子分析文本；支持两种或更多本机音色按顺序循环朗读，并合并成一个成品文件。</li>
+                      <li>多人朗读可设置每几个内容单元切换音色，并在生成前预览音色与段落分配。</li>
+                      <li>程序默认模型改为 OmniVoice，默认输出格式改为 MP3。</li>
+                    </ul>
+                  </section>
+                  <section class="about-release">
+                    <div class="about-release-head"><strong>v0.4.1</strong><span>2026-09-21 · OmniVoice 表达预设与 Skill 调度</span></div>
+                    <ul>
+                      <li>WebUI 和 OmniVoice Skill 新增跟随参考、平静、高兴、悲伤、激昂、严肃、耳语和自定义表达选项，可供用户、Agent 或外部 WebUI 读取。</li>
+                      <li>修复 OmniVoice 克隆模式丢弃 instruct 的问题；MLX 和 VoiceStudio 原生运行时均可将参考音色与有效风格属性组合。</li>
+                      <li>平静、高兴、悲伤等明确标注为基于原生音高、语速和采样参数的表达预设；OmniVoice 本身不提供 IndexTTS 式情绪向量。</li>
+                      <li>新增适配器回归测试和真实“平静”音频合成验证。</li>
+                    </ul>
+                  </section>
+                  <section class="about-release">
+                    <div class="about-release-head"><strong>v0.4.0</strong><span>2026-09-11 · VoiceStudio 接入、Fish 响度与速度优化</span></div>
+                    <ul>
+                      <li>接入 VoiceStudio v0.5.2（源码提交 38c2405），使用 k2-fsa/OmniVoice 原生权重、PyTorch/MPS 与 24 kHz 输出；支持音色克隆、设计和自动音色。</li>
+                      <li>五个引擎入口分别保存、恢复和重置参数；VoiceStudio 默认 32 步、引导强度 2.0，与 OmniVoice MLX 独立保存参数和参考文本。</li>
+                      <li>原生引擎支持逐段保存、进度、暂停和终止，切换引擎后释放子进程。</li>
+                      <li>Fish 成品统一提高最多 6 dB，真实峰值不超过 -1.1 dBTP；采用线性增益，不添加压缩或均衡。缓存参考编码以减少重复转换耗时。</li>
+                      <li>空间清理：SHA-256 校验后将重复音频编码器改为硬链接共享，减少约 768 MiB 重复占用；清理约 52 KiB 可重建测试缓存。接入新增占用由约 3.15 GiB 降至约 2.40 GiB（共享文件只计一次）。</li>
+                      <li>应用版本 v0.4.0 与上游 VoiceStudio v0.5.2 分别记录；本次接入其原生 OmniVoice 引擎，未安装全部桌面应用和其他引擎。</li>
+                    </ul>
+                  </section>
                   <section class="about-release">
                     <div class="about-release-head"><strong>v0.3.4</strong><span>2026-09-10 · Fish 无损内存加速</span></div>
                     <ul>
@@ -4271,13 +5208,13 @@ def build_ui() -> gr.Blocks:
                         """
                         <div class="queue-guide">
                           <strong>使用顺序：</strong>
-                          ① 一次选择多份文档并加入队列；② 在下方主文本框逐份预览、编辑；
-                          ③ 点击“确认当前文档”；④ 调整顺序后启动队列。全部确认后才允许自动执行。
+                          ① 导入并解析电子书一次；② 每次选一章，预览后点击“确认当前章节”，可继续选下一章；
+                          ③ 每章作为独立任务加入队列；④ 启动队列后逐章生成音频。
                         </div>
                         """
                     )
                     queue_document_files = gr.File(
-                        label="选择排队文档（可一次选择多份）",
+                        label="选择文档（可一次选择多份）",
                         file_count="multiple",
                         file_types=[
                             ".txt",
@@ -4294,12 +5231,25 @@ def build_ui() -> gr.Blocks:
                         elem_classes=["queue-file-picker"],
                     )
                     add_queue_documents_button = gr.Button(
-                        "解析并加入队列",
+                        "解析文档",
                         variant="secondary",
+                    )
+                    queue_book_selector = gr.Dropdown(
+                        label="已解析电子书（选一章，确认后可继续选下一章）",
+                        choices=[],
+                        value=None,
+                        visible=False,
+                    )
+                    queue_chapter_selector = gr.Dropdown(
+                        label="选择本次要生成的章节",
+                        choices=[],
+                        value=None,
+                        filterable=True,
+                        visible=False,
                     )
                     document_queue_summary = gr.HTML(render_document_queue([]))
                     queue_document_selector = gr.Dropdown(
-                        label="选择一份文档进行预览与确认",
+                        label="已加入队列的任务（可预览、编辑）",
                         choices=[],
                         value=None,
                         filterable=True,
@@ -4310,7 +5260,7 @@ def build_ui() -> gr.Blocks:
                         queue_remove_button = gr.Button("移除")
                     with gr.Row(elem_classes=["queue-actions"]):
                         queue_confirm_button = gr.Button(
-                            "确认当前文档",
+                            "确认当前章节 / 文档",
                             scale=1,
                             elem_classes=["queue-confirm-action"],
                         )
@@ -4349,7 +5299,7 @@ def build_ui() -> gr.Blocks:
                     )
                     with gr.Row(elem_classes=["document-actions"]):
                         load_selected_button = gr.Button(
-                            "载入选中章节",
+                            "导入所选章节",
                             elem_classes=["document-action"],
                         )
                         load_all_button = gr.Button(
@@ -4361,7 +5311,7 @@ def build_ui() -> gr.Blocks:
                             elem_classes=["document-action"],
                         )
                     document_preview = gr.Textbox(
-                        label="解析预览",
+                        label="所选章节预览",
                         interactive=False,
                         lines=3,
                         elem_classes=["document-preview"],
@@ -4375,6 +5325,60 @@ def build_ui() -> gr.Blocks:
                     max_lines=28,
                     elem_classes=["text-entry"],
                 )
+                with gr.Row(elem_classes=["text-cleanup-actions"]):
+                    clean_text_button = gr.Button(
+                        "文本格式清洗",
+                        variant="secondary",
+                        elem_classes=["text-cleanup-primary"],
+                    )
+                    undo_text_cleanup_button = gr.Button(
+                        "撤销上次清洗",
+                        elem_classes=["text-cleanup-undo"],
+                    )
+                gr.Markdown(
+                    "清洗会删除纯数字括号/脚注、网址、Markdown 标记、表情和装饰符号，"
+                    "整理空格与标点；日期、金额、百分比及正常正文会保留。"
+                )
+                with gr.Accordion(
+                    "多人 / 多音色轮换朗读",
+                    open=False,
+                    elem_classes=["multi-voice-narration"],
+                ):
+                    multi_voice_enabled = gr.Checkbox(
+                        label="启用多人朗读",
+                        value=False,
+                        info="默认关闭。开启后，单次生成和文档队列都会按下方设置轮换音色；队列每份文档独立生成音频。",
+                    )
+                    multi_voice_ids = gr.Dropdown(
+                        label="朗读音色（按选择顺序循环）",
+                        choices=_voice_library_choices(),
+                        value=[],
+                        multiselect=True,
+                        filterable=True,
+                        info="至少选择两种音色，可选择更多。",
+                    )
+                    with gr.Row():
+                        multi_voice_split_mode = gr.Dropdown(
+                            label="内容分析方式",
+                            choices=[
+                                ("按自然段（空行分隔）", "paragraph"),
+                                ("按非空行", "line"),
+                                ("按句子", "sentence"),
+                            ],
+                            value="paragraph",
+                        )
+                        multi_voice_switch_every = gr.Number(
+                            label="每几个单元切换音色",
+                            value=1,
+                            minimum=1,
+                            maximum=20,
+                            step=1,
+                            precision=0,
+                        )
+                    analyze_multi_voice_button = gr.Button("分析并预览朗读顺序")
+                    multi_voice_plan = gr.HTML(
+                        '<div class="multi-voice-empty">选择音色后，可预览每段由谁朗读。</div>'
+                    )
                 with gr.Accordion(
                     "本机音色库 · 批量上传与试听",
                     open=True,
@@ -4506,16 +5510,31 @@ def build_ui() -> gr.Blocks:
                             label="合成模型",
                             choices=list(MODEL_BACKENDS),
                             value=initial_config["model_backend"],
-                            info="2.5 高保真克隆；2.0 可控情绪；OmniVoice 与 Fish S2 Pro 为本地 MLX 模型。",
+                            info="2.5 高保真克隆；2.0 可控情绪；OmniVoice / Fish 使用 MLX；CosyVoice 3 使用 macOS MLX/MPS；VoiceStudio 使用原生运行时。每个入口独立保存参数。",
                         )
                         emotion = gr.Dropdown(
                             label="表达方式 / 情绪",
-                            choices=list(EMOTIONS),
-                            value=initial_config["emotion"],
-                            interactive=initial_config["model_backend"] == "IndexTTS 2.0",
+                            choices=(
+                                list(OMNIVOICE_EXPRESSION_PRESETS)
+                                if initial_config["model_backend"] in OMNIVOICE_BACKENDS
+                                else list(EMOTIONS)
+                            ),
+                            value=(
+                                initial_config["emotion"]
+                                if initial_config["emotion"] in (
+                                    OMNIVOICE_EXPRESSION_PRESETS
+                                    if initial_config["model_backend"] in OMNIVOICE_BACKENDS
+                                    else EMOTIONS
+                                )
+                                else "跟随参考音频"
+                            ),
+                            interactive=(
+                                initial_config["model_backend"] == "IndexTTS 2.0"
+                                or initial_config["model_backend"] in OMNIVOICE_BACKENDS
+                            ),
+                            visible=True,
                             info=(
-                                "仅 IndexTTS 2.0 使用具体情绪；2.5 跟随参考音频，"
-                                "OmniVoice 使用下方的音色设计参数。"
+                                "IndexTTS 2.0 使用原生情绪；OmniVoice 使用表达预设。"
                             ),
                         )
                         with gr.Row(elem_classes=["compact-parameter-grid"]):
@@ -4540,10 +5559,10 @@ def build_ui() -> gr.Blocks:
                                 precision=0,
                                 info="相同参数和种子便于复现相近结果。",
                             )
-                        with gr.Group(visible=initial_config["model_backend"] == "OmniVoice") as omnivoice_controls:
+                        with gr.Group(visible=initial_config["model_backend"] in OMNIVOICE_BACKENDS) as omnivoice_controls:
                             gr.Markdown(
-                                "**OmniVoice 本地参数**  模型权重为 CC-BY-NC（非商业），"
-                                "并非小米官方 MiMo。克隆时强烈建议填写参考音频原文。"
+                                "**OmniVoice / VoiceStudio 参数**  两个入口分别保存参数；VoiceStudio v0.5.2 使用原生 MPS，OmniVoice 使用 MLX。模型权重为 CC-BY-NC（非商业），"
+                                "并非小米官方 MiMo。克隆参考建议 3–10 秒；较长音频会自动安全截取并重新对齐原文。"
                             )
                             omnivoice_mode = gr.Dropdown(
                                 label="OmniVoice 工作模式",
@@ -4562,9 +5581,9 @@ def build_ui() -> gr.Blocks:
                                 lines=2,
                             )
                             omnivoice_instruct = gr.Textbox(
-                                label="音色设计描述（仅设计模式）",
+                                label="OmniVoice 原生风格属性（可选）",
                                 value=initial_config["omnivoice_instruct"],
-                                placeholder="例如：温暖、成熟的女声，语速自然，带轻微微笑",
+                                placeholder="例如：female, young adult, high pitch 或 whisper",
                                 lines=2,
                             )
                             with gr.Row():
@@ -4577,10 +5596,18 @@ def build_ui() -> gr.Blocks:
                                 omnivoice_layer_penalty_factor = gr.Number(label="层惩罚系数", value=initial_config["omnivoice_layer_penalty_factor"], minimum=0, maximum=10, step=0.1)
                             with gr.Row():
                                 omnivoice_t_shift = gr.Number(label="T-Shift", value=initial_config["omnivoice_t_shift"], minimum=0, maximum=1, step=0.01)
-                                omnivoice_ref_audio_max_duration_s = gr.Number(label="参考音频最长（秒）", value=initial_config["omnivoice_ref_audio_max_duration_s"], minimum=3, maximum=30, step=0.5)
+                                omnivoice_ref_audio_max_duration_s = gr.Number(
+                                    label="高质量参考长度（秒）",
+                                    value=min(10.0, initial_config["omnivoice_ref_audio_max_duration_s"]),
+                                    minimum=3,
+                                    maximum=10,
+                                    step=0.5,
+                                    info="官方建议 3–10 秒；超过此长度会在低能量边界截取，并自动重新对齐原文。",
+                                )
                         with gr.Group(visible=initial_config["model_backend"] == "Fish Audio S2 Pro") as fish_s2_controls:
                             gr.Markdown(
                                 "**Fish Audio S2 Pro 参数**  本机使用 8-bit MLX 权重，输出 44.1 kHz。"
+                                "成品默认整体提升 6 dB，按真实峰值自动限制；不压缩动态、不改变语速。"
                                 "权重仅限研究及非商业使用；商业用途需要 Fish Audio 单独授权。"
                             )
                             fish_mode = gr.Dropdown(
@@ -4623,6 +5650,33 @@ def build_ui() -> gr.Blocks:
                                     precision=0,
                                 )
                                 fish_ref_audio_max_duration_s = gr.Number(label="参考音频最长（秒）", value=initial_config["fish_ref_audio_max_duration_s"], minimum=3, maximum=30, step=0.5)
+                        with gr.Group(visible=initial_config["model_backend"] == "CosyVoice 3") as cosyvoice3_controls:
+                            gr.Markdown(
+                                "**CosyVoice 3 参数**  使用 Fun-CosyVoice3-0.5B-2512 原始权重，"
+                                "MLX 处理语言模型，MPS 处理流匹配；参考音频建议 3–10 秒清晰单人声。"
+                                "优先使用对齐的参考原文，以提高音色相似度。"
+                            )
+                            cosy_ref_text = gr.Textbox(
+                                label="参考音频原文（留空将自动识别并按音色缓存）",
+                                value=initial_cosy_ref_text,
+                                lines=2,
+                            )
+                            with gr.Row():
+                                cosy_precision = gr.Dropdown(
+                                    label="语言模型精度",
+                                    choices=[("快速 FP16", "fp16"), ("完整 FP32", "fp32")],
+                                    value=initial_config["cosy_precision"],
+                                )
+                                cosy_nfe = gr.Number(
+                                    label="流匹配步数（音质优先推荐 10）",
+                                    value=initial_config["cosy_nfe"], minimum=4, maximum=20,
+                                    step=1, precision=0,
+                                )
+                                cosy_ref_audio_max_duration_s = gr.Number(
+                                    label="参考音频最长（秒）",
+                                    value=initial_config["cosy_ref_audio_max_duration_s"],
+                                    minimum=3, maximum=10, step=0.5,
+                                )
                     with gr.Row(elem_classes=["compact-generation-controls"]):
                         generate_button = gr.Button(
                             "开始生成",
@@ -4646,29 +5700,42 @@ def build_ui() -> gr.Blocks:
 
                 with gr.Column(elem_classes=["panel", "result-panel"]):
                     gr.HTML('<div class="panel-heading">03 · 输出与状态</div>')
-                    with gr.Row(elem_classes=["output-settings"]):
-                        output_format = gr.Dropdown(
-                            label="输出格式",
-                            choices=[
-                                ("WAV（无损）", "wav"),
-                                ("MP3（通用）", "mp3"),
-                                ("FLAC（无损压缩）", "flac"),
-                            ],
-                            value="wav",
-                            scale=2,
-                        )
+                    output_format = gr.Dropdown(
+                        label="输出格式",
+                        choices=[
+                            ("WAV（无损）", "wav"),
+                            ("MP3（通用）", "mp3"),
+                            ("FLAC（无损压缩）", "flac"),
+                        ],
+                        value=initial_config["output_format"],
+                    )
+                    output_directory = gr.Textbox(
+                        label="输出文件夹",
+                        value=initial_config["output_directory"],
+                        placeholder="填写绝对路径，或相对于项目目录的路径",
+                        lines=1,
+                        max_lines=1,
+                        elem_classes=["output-directory-field"],
+                    )
+                    with gr.Row(elem_classes=["output-folder-actions"]):
                         open_output_button = gr.Button(
                             "打开文件夹",
                             scale=1,
+                            min_width=0,
                             elem_classes=["output-folder-action"],
                         )
-                    output_directory = gr.Textbox(
-                        label="输出文件夹",
-                        value=str(OUTPUT_DIR),
-                        placeholder="可填写绝对路径，或相对于项目目录的路径",
-                        info="修改后自动保存；不存在的文件夹会在生成时创建。",
-                        lines=1,
-                    )
+                        choose_output_button = gr.Button(
+                            "选择文件夹",
+                            scale=1,
+                            min_width=0,
+                            elem_classes=["output-folder-action"],
+                        )
+                        apply_output_button = gr.Button(
+                            "使用此文件夹",
+                            scale=1,
+                            min_width=0,
+                            elem_classes=["output-folder-action"],
+                        )
                     gr.HTML('<div class="result-section-label">本次生成</div>')
                     generation_progress = gr.HTML(render_generation_progress())
                     generation_progress_timer = gr.Timer(value=1.0, active=True)
@@ -4707,11 +5774,36 @@ def build_ui() -> gr.Blocks:
                         elem_classes=["status-box"],
                     )
 
+        clean_text_button.click(
+            fn=clean_text_from_ui,
+            inputs=[text],
+            outputs=[text, text_cleanup_undo_state, status],
+            queue=False,
+        )
+        undo_text_cleanup_button.click(
+            fn=undo_text_cleanup,
+            inputs=[text_cleanup_undo_state, text],
+            outputs=[text, text_cleanup_undo_state, status],
+            queue=False,
+        )
+        analyze_multi_voice_button.click(
+            fn=render_multi_voice_plan,
+            inputs=[text, multi_voice_ids, multi_voice_split_mode, multi_voice_switch_every],
+            outputs=[multi_voice_plan],
+            queue=False,
+        )
+
         document_file.change(
             fn=parse_uploaded_document,
             inputs=[document_file],
             outputs=[document_state, document_summary, chapter_selector, document_preview],
             concurrency_limit=1,
+        )
+        chapter_selector.change(
+            fn=preview_document_chapters,
+            inputs=[document_state, chapter_selector],
+            outputs=[document_preview],
+            queue=False,
         )
         load_selected_button.click(
             fn=load_document_chapters,
@@ -4738,21 +5830,41 @@ def build_ui() -> gr.Blocks:
             queue=False,
         )
 
-        add_queue_documents_button.click(
+        add_queue_event = add_queue_documents_button.click(
             fn=add_documents_to_queue,
-            inputs=[queue_document_files, document_queue_state],
+            inputs=[queue_document_files, document_queue_state, queue_book_sources],
             outputs=[
                 document_queue_state,
+                queue_book_sources,
                 queue_document_selector,
+                queue_book_selector,
                 document_queue_summary,
                 queue_document_files,
                 status,
             ],
             concurrency_limit=1,
         )
-        queue_document_selector.change(
+        add_queue_event.then(
+            fn=preview_added_queue_entry,
+            inputs=[document_queue_state, queue_book_sources, queue_document_selector, queue_book_selector],
+            outputs=[text, status, queue_chapter_selector],
+            queue=False,
+        )
+        queue_book_selector.input(
+            fn=preview_queue_book,
+            inputs=[queue_book_sources, queue_book_selector, document_queue_state],
+            outputs=[queue_document_selector, text, status, queue_chapter_selector],
+            queue=False,
+        )
+        queue_document_selector.input(
             fn=preview_queue_document,
             inputs=[document_queue_state, queue_document_selector],
+            outputs=[text, status, queue_chapter_selector, queue_book_selector],
+            queue=False,
+        )
+        queue_chapter_selector.input(
+            fn=preview_queue_book_chapter,
+            inputs=[queue_book_sources, queue_book_selector, queue_chapter_selector],
             outputs=[text, status],
             queue=False,
         )
@@ -4764,12 +5876,15 @@ def build_ui() -> gr.Blocks:
         )
         queue_confirm_button.click(
             fn=confirm_queue_document,
-            inputs=[document_queue_state, queue_document_selector, text],
+            inputs=[document_queue_state, queue_document_selector, text,
+                    queue_book_sources, queue_book_selector, queue_chapter_selector],
             outputs=[
                 document_queue_state,
                 queue_document_selector,
                 document_queue_summary,
                 status,
+                queue_chapter_selector,
+                text,
             ],
             queue=False,
         )
@@ -4788,7 +5903,7 @@ def build_ui() -> gr.Blocks:
                 ],
                 queue=False,
             )
-        queue_remove_button.click(
+        queue_remove_event = queue_remove_button.click(
             fn=remove_queue_document,
             inputs=[document_queue_state, queue_document_selector],
             outputs=[
@@ -4798,6 +5913,12 @@ def build_ui() -> gr.Blocks:
                 text,
                 status,
             ],
+            queue=False,
+        )
+        queue_remove_event.then(
+            fn=preview_queue_document,
+            inputs=[document_queue_state, queue_document_selector],
+            outputs=[text, status, queue_chapter_selector, queue_book_selector],
             queue=False,
         )
 
@@ -4821,6 +5942,12 @@ def build_ui() -> gr.Blocks:
             ],
             queue=False,
         )
+        save_voice_batch_event.then(
+            fn=refresh_multi_voice_choices,
+            inputs=[multi_voice_ids],
+            outputs=[multi_voice_ids],
+            queue=False,
+        )
 
         voice_library_selector.change(
             fn=select_voice_from_library,
@@ -4836,7 +5963,7 @@ def build_ui() -> gr.Blocks:
         )
         voice_library_selector.change(
             fn=load_voice_omnivoice_transcript,
-            inputs=[voice_library_selector],
+            inputs=[voice_library_selector, model_backend],
             outputs=[omnivoice_ref_text],
             queue=False,
         )
@@ -4844,6 +5971,12 @@ def build_ui() -> gr.Blocks:
             fn=load_voice_fish_transcript,
             inputs=[voice_library_selector],
             outputs=[fish_ref_text],
+            queue=False,
+        )
+        voice_library_selector.change(
+            fn=load_voice_cosy_transcript,
+            inputs=[voice_library_selector],
+            outputs=[cosy_ref_text],
             queue=False,
         )
 
@@ -4865,7 +5998,7 @@ def build_ui() -> gr.Blocks:
             )
             quick_select_event.then(
                 fn=load_voice_omnivoice_transcript,
-                inputs=[voice_library_selector],
+                inputs=[voice_library_selector, model_backend],
                 outputs=[omnivoice_ref_text],
                 queue=False,
             )
@@ -4873,6 +6006,12 @@ def build_ui() -> gr.Blocks:
                 fn=load_voice_fish_transcript,
                 inputs=[voice_library_selector],
                 outputs=[fish_ref_text],
+                queue=False,
+            )
+            quick_select_event.then(
+                fn=load_voice_cosy_transcript,
+                inputs=[voice_library_selector],
+                outputs=[cosy_ref_text],
                 queue=False,
             )
             remove_favorite_event = quick_remove_button.click(
@@ -4938,6 +6077,12 @@ def build_ui() -> gr.Blocks:
             ],
             queue=False,
         )
+        delete_voice_event.then(
+            fn=refresh_multi_voice_choices,
+            inputs=[multi_voice_ids],
+            outputs=[multi_voice_ids],
+            queue=False,
+        )
 
         # Audio.input also fires when the user merely enters microphone mode,
         # before a recording exists. Persist only completed uploads/recordings.
@@ -4969,7 +6114,7 @@ def build_ui() -> gr.Blocks:
             )
             reference_audio_event.then(
                 fn=load_voice_omnivoice_transcript,
-                inputs=[voice_library_selector],
+                inputs=[voice_library_selector, model_backend],
                 outputs=[omnivoice_ref_text],
                 queue=False,
             )
@@ -4977,6 +6122,12 @@ def build_ui() -> gr.Blocks:
                 fn=load_voice_fish_transcript,
                 inputs=[voice_library_selector],
                 outputs=[fish_ref_text],
+                queue=False,
+            )
+            reference_audio_event.then(
+                fn=load_voice_cosy_transcript,
+                inputs=[voice_library_selector],
+                outputs=[cosy_ref_text],
                 queue=False,
             )
 
@@ -5004,28 +6155,6 @@ def build_ui() -> gr.Blocks:
                 queue=False,
             )
 
-        reset_settings.click(
-            fn=reset_advanced_settings,
-            outputs=[
-                emotion,
-                emotion_strength,
-                speed,
-                seed,
-                interval_silence,
-                segment_overlap_ms,
-                max_text_tokens,
-                temperature,
-                diffusion_steps,
-                max_mel_tokens,
-                top_p,
-                top_k,
-                repetition_penalty,
-                cfg_rate,
-                fast_vocoder,
-            ],
-            queue=False,
-        )
-
         settings_inputs = [
             model_backend,
             emotion,
@@ -5046,8 +6175,8 @@ def build_ui() -> gr.Blocks:
             output_format,
             output_directory,
         ]
-        for setting_component in settings_inputs:
-            setting_component.change(
+        for setting_component in settings_inputs[1:-1]:
+            setting_component.input(
                 fn=save_user_settings,
                 inputs=settings_inputs,
                 queue=False,
@@ -5068,7 +6197,7 @@ def build_ui() -> gr.Blocks:
             omnivoice_ref_audio_max_duration_s,
         ]
         for omnivoice_component in omnivoice_inputs:
-            omnivoice_component.change(
+            omnivoice_component.input(
                 fn=save_omnivoice_settings,
                 inputs=omnivoice_inputs,
                 queue=False,
@@ -5085,22 +6214,43 @@ def build_ui() -> gr.Blocks:
             fish_ref_audio_max_duration_s,
         ]
         for fish_component in fish_s2_inputs:
-            fish_component.change(
+            fish_component.input(
                 fn=save_fish_s2_settings,
                 inputs=fish_s2_inputs,
                 queue=False,
             )
-        model_backend.change(
-            fn=update_model_controls,
+        cosyvoice3_inputs = [
+            cosy_ref_text, cosy_precision, cosy_nfe, cosy_ref_audio_max_duration_s,
+        ]
+        for cosy_component in cosyvoice3_inputs:
+            cosy_component.input(
+                fn=save_cosyvoice3_settings,
+                inputs=cosyvoice3_inputs,
+                queue=False,
+            )
+        model_backend.input(
+            fn=switch_model_settings,
             inputs=[model_backend],
-            outputs=[omnivoice_controls, fish_s2_controls, emotion],
+            outputs=[*settings_inputs[1:-2], *omnivoice_inputs, *fish_s2_inputs,
+                     *cosyvoice3_inputs, omnivoice_controls, fish_s2_controls,
+                     cosyvoice3_controls, index_presets],
             queue=False,
         )
 
+        profile_outputs = [*settings_inputs[1:-2], *omnivoice_inputs, *fish_s2_inputs,
+                           *cosyvoice3_inputs, omnivoice_controls, fish_s2_controls,
+                           cosyvoice3_controls, index_presets]
+        reset_settings.click(
+            fn=reset_selected_model_settings, inputs=[model_backend],
+            outputs=profile_outputs, queue=False,
+        )
         demo.load(
             fn=load_saved_state,
             outputs=[reference_audio, voice_profile, *settings_inputs],
             queue=False,
+        ).then(
+            fn=lambda: switch_model_settings(read_user_config()["model_backend"]),
+            outputs=profile_outputs, queue=False,
         )
         demo.load(
             fn=resolve_saved_voice_preview,
@@ -5129,6 +6279,12 @@ def build_ui() -> gr.Blocks:
             queue=False,
         )
         demo.load(
+            fn=refresh_multi_voice_choices,
+            inputs=[multi_voice_ids],
+            outputs=[multi_voice_ids],
+            queue=False,
+        )
+        demo.load(
             fn=render_generation_progress,
             outputs=[generation_progress],
             queue=False,
@@ -5141,6 +6297,18 @@ def build_ui() -> gr.Blocks:
 
         open_output_button.click(
             fn=open_output_directory,
+            inputs=[output_directory],
+            outputs=[status],
+            queue=False,
+        )
+        choose_output_button.click(
+            fn=choose_output_directory,
+            inputs=[output_directory],
+            outputs=[output_directory, status],
+            queue=False,
+        )
+        apply_output_button.click(
+            fn=apply_output_directory,
             inputs=[output_directory],
             outputs=[status],
             queue=False,
@@ -5283,6 +6451,11 @@ def build_ui() -> gr.Blocks:
                 output_directory,
                 live_playback,
                 *fish_s2_inputs,
+                *cosyvoice3_inputs,
+                multi_voice_enabled,
+                multi_voice_ids,
+                multi_voice_split_mode,
+                multi_voice_switch_every,
             ],
             outputs=[
                 output_audio,
@@ -5320,6 +6493,11 @@ def build_ui() -> gr.Blocks:
                 output_format,
                 output_directory,
                 *fish_s2_inputs,
+                *cosyvoice3_inputs,
+                multi_voice_enabled,
+                multi_voice_ids,
+                multi_voice_split_mode,
+                multi_voice_switch_every,
             ],
             outputs=[
                 document_queue_state,

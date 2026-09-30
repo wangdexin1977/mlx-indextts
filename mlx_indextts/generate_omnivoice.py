@@ -17,6 +17,8 @@ from mlx_indextts.generate_v2 import GenerationCancelled
 
 
 SAMPLE_RATE = 24_000
+REFERENCE_PROMPT_CACHE_VERSION = 2
+MAX_QUALITY_REFERENCE_SECONDS = 10.0
 
 
 class _TokenizerAdapter:
@@ -50,11 +52,94 @@ class OmniVoiceTTS:
         self.last_reference_transcript = ""
 
     @staticmethod
-    def _reference_cache_key(reference_audio: str, max_duration_s: float) -> str:
+    def _reference_cache_key(
+        reference_audio: str,
+        max_duration_s: float,
+        ref_text: str = "",
+    ) -> str:
         path = Path(reference_audio).resolve()
         stat = path.stat()
-        source = f"{path}:{stat.st_size}:{stat.st_mtime_ns}:{float(max_duration_s):.2f}"
+        source = (
+            f"v{REFERENCE_PROMPT_CACHE_VERSION}:{path}:{stat.st_size}:"
+            f"{stat.st_mtime_ns}:{float(max_duration_s):.2f}:{str(ref_text).strip()}"
+        )
         return hashlib.sha256(source.encode()).hexdigest()
+
+    @staticmethod
+    def _reference_excerpt(
+        audio: np.ndarray,
+        sample_rate: int,
+        max_duration_s: float,
+    ) -> tuple[np.ndarray, bool]:
+        """Keep a clean prompt no longer than OmniVoice's recommended 10 seconds."""
+        mono = np.asarray(audio, dtype=np.float32).squeeze()
+        if mono.ndim != 1:
+            mono = np.mean(mono, axis=-1, dtype=np.float32)
+        mono = np.nan_to_num(mono, copy=False)
+        if mono.size == 0:
+            raise ValueError("OmniVoice 参考音频为空。")
+
+        peak = float(np.max(np.abs(mono)))
+        threshold = max(1e-4, peak * 0.01)
+        active = np.flatnonzero(np.abs(mono) >= threshold)
+        if active.size:
+            padding = int(sample_rate * 0.08)
+            start = max(0, int(active[0]) - padding)
+            end = min(mono.size, int(active[-1]) + padding + 1)
+            mono = mono[start:end]
+
+        requested = max(3.0, float(max_duration_s))
+        limit_s = min(requested, MAX_QUALITY_REFERENCE_SECONDS)
+        limit = max(1, int(sample_rate * limit_s))
+        was_shortened = mono.size > limit
+        if was_shortened:
+            # Prefer a quiet boundary close to the limit so the prompt does not
+            # end in the middle of a syllable. Search only the final 1.5 seconds
+            # to retain as much speaker evidence as possible.
+            search_start = max(int(sample_rate * 3.0), limit - int(sample_rate * 1.5))
+            window = max(1, int(sample_rate * 0.04))
+            envelope = np.convolve(
+                np.abs(mono[:limit]),
+                np.ones(window, dtype=np.float32) / window,
+                mode="same",
+            )
+            boundary = search_start + int(np.argmin(envelope[search_start:limit]))
+            if boundary >= int(sample_rate * 3.0):
+                limit = boundary
+            mono = mono[:limit]
+
+        mono = mono - float(np.mean(mono))
+        fade = min(int(sample_rate * 0.01), mono.size // 2)
+        if fade:
+            ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+            mono[:fade] *= ramp
+            mono[-fade:] *= ramp[::-1]
+        return mono.astype(np.float32, copy=False), was_shortened
+
+    @staticmethod
+    def _postprocess_audio(audio: np.ndarray) -> np.ndarray:
+        """Apply transparent edge cleanup without changing the model timbre."""
+        cleaned = np.asarray(audio, dtype=np.float32).squeeze()
+        if cleaned.ndim != 1:
+            cleaned = np.mean(cleaned, axis=-1, dtype=np.float32)
+        cleaned = np.nan_to_num(cleaned, copy=False)
+        if cleaned.size == 0:
+            return cleaned
+        cleaned = cleaned - float(np.mean(cleaned))
+        peak = float(np.max(np.abs(cleaned)))
+        threshold = max(1e-4, peak * 0.003)
+        active = np.flatnonzero(np.abs(cleaned) >= threshold)
+        if active.size:
+            padding = int(SAMPLE_RATE * 0.05)
+            start = max(0, int(active[0]) - padding)
+            end = min(cleaned.size, int(active[-1]) + padding + 1)
+            cleaned = cleaned[start:end]
+        fade = min(int(SAMPLE_RATE * 0.01), cleaned.size // 2)
+        if fade:
+            ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+            cleaned[:fade] *= ramp
+            cleaned[-fade:] *= ramp[::-1]
+        return np.clip(cleaned, -1.0, 1.0)
 
     def _prepare_reference_prompt(
         self,
@@ -66,21 +151,66 @@ class OmniVoiceTTS:
         import mlx.core as mx
         from mlx_audio.tts.models.omnivoice.utils import create_voice_clone_prompt
 
-        key = self._reference_cache_key(reference_audio, max_duration_s)
-        cached = self.cache.get(key)
         manual_text = str(ref_text or "").strip()
-        if cached is not None and (not manual_text or manual_text == cached[1]):
+        key = self._reference_cache_key(reference_audio, max_duration_s, manual_text)
+        cached = self.cache.get(key)
+        if cached is not None:
             self.last_reference_transcript = str(cached[1])
             return cached
 
-        ref_tokens = create_voice_clone_prompt(
-            reference_audio,
-            tokenizer=self.runtime.audio_tokenizer,
-            max_duration_s=float(max_duration_s),
+        import librosa
+
+        source_audio, source_sr = librosa.load(reference_audio, sr=None, mono=True)
+        if int(source_sr) != SAMPLE_RATE:
+            source_audio = librosa.resample(
+                source_audio,
+                orig_sr=int(source_sr),
+                target_sr=SAMPLE_RATE,
+                res_type="soxr_hq",
+            )
+        excerpt, was_shortened = self._reference_excerpt(
+            source_audio,
+            SAMPLE_RATE,
+            max_duration_s,
         )
-        mx.eval(ref_tokens)
-        aligned_text = manual_text
-        if not aligned_text:
+        temporary_name = ""
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temporary:
+                temporary_name = temporary.name
+            sf.write(temporary_name, excerpt, SAMPLE_RATE, subtype="PCM_24")
+            ref_tokens = create_voice_clone_prompt(
+                temporary_name,
+                tokenizer=self.runtime.audio_tokenizer,
+                max_duration_s=min(float(max_duration_s), MAX_QUALITY_REFERENCE_SECONDS),
+            )
+            mx.eval(ref_tokens)
+
+            # A transcript for the original 15-second library preview no longer
+            # aligns after selecting the high-quality 10-second excerpt. In that
+            # case, transcribe the exact waveform that was encoded.
+            aligned_text = "" if was_shortened else manual_text
+            if not aligned_text:
+                aligned_text = self._transcribe_reference(temporary_name)
+        finally:
+            if temporary_name:
+                Path(temporary_name).unlink(missing_ok=True)
+
+        cached = (ref_tokens, aligned_text)
+        self.cache[key] = cached
+        self.last_reference_transcript = aligned_text
+        return cached
+
+    def _transcribe_reference(self, reference_wav: str) -> str:
+        """Transcribe the exact prompt waveform passed to the audio tokenizer."""
+        import mlx.core as mx
+
+        if not self.asr_model_dir or not Path(self.asr_model_dir).is_dir():
+            raise ValueError(
+                "OmniVoice 高质量克隆需要本地 ASR 对齐参考片段，"
+                "但未找到 ASR 模型。"
+            )
+        temporary_name = ""
+        try:
             if not self.asr_model_dir or not Path(self.asr_model_dir).is_dir():
                 raise ValueError(
                     "OmniVoice 克隆缺少参考原文，且本地 ASR 模型未安装。"
@@ -88,31 +218,16 @@ class OmniVoiceTTS:
                 )
             from mlx_audio.stt.utils import load_model as load_stt
 
-            decoded = np.asarray(
-                self.runtime.audio_tokenizer.decode(ref_tokens).astype(mx.float32),
-                dtype=np.float32,
-            ).squeeze()
-            temporary_name = ""
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temporary:
-                    temporary_name = temporary.name
-                sf.write(temporary_name, decoded, SAMPLE_RATE, subtype="PCM_16")
-                stt = load_stt(Path(self.asr_model_dir))
-                transcription = stt.generate(temporary_name)
-                aligned_text = str(getattr(transcription, "text", "") or "").strip()
-                del stt
-            finally:
-                if temporary_name:
-                    Path(temporary_name).unlink(missing_ok=True)
-                gc.collect()
-                mx.clear_cache()
-            if not aligned_text:
-                raise RuntimeError("ASR 未能识别参考音频，请换用 5–15 秒清晰人声。")
-
-        cached = (ref_tokens, aligned_text)
-        self.cache[key] = cached
-        self.last_reference_transcript = aligned_text
-        return cached
+            stt = load_stt(Path(self.asr_model_dir))
+            transcription = stt.generate(reference_wav)
+            aligned_text = str(getattr(transcription, "text", "") or "").strip()
+            del stt
+        finally:
+            gc.collect()
+            mx.clear_cache()
+        if not aligned_text:
+            raise RuntimeError("ASR 未能识别参考音频，请换用 3–10 秒清晰人声。")
+        return aligned_text
 
     @staticmethod
     def split_text(text: str, max_tokens_per_segment: int = 120) -> list[str]:
@@ -226,7 +341,10 @@ class OmniVoiceTTS:
                     text=piece,
                     duration_s=piece_duration,
                     language=str(language or "None"),
-                    instruct=str(instruct or "None") if mode == "design" else "None",
+                    # OmniVoice supports combining a reference clip with valid
+                    # style attributes.  Keep the reference as the identity
+                    # anchor and pass the optional style in clone mode too.
+                    instruct=str(instruct or "None"),
                     ref_audio=None,
                     ref_tokens=ref_tokens,
                     ref_text=aligned_ref_text or None,
@@ -241,8 +359,7 @@ class OmniVoiceTTS:
             )
             if not results:
                 raise RuntimeError("OmniVoice 未返回音频。")
-            audio = np.asarray(results[-1].audio, dtype=np.float32).squeeze()
-            audio = np.clip(audio, -1.0, 1.0)
+            audio = self._postprocess_audio(results[-1].audio)
             generated.append(audio)
             if audio_chunk_callback:
                 audio_chunk_callback(audio, SAMPLE_RATE)

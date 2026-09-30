@@ -13,7 +13,7 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent.parent
 APP_URL = "http://127.0.0.1:7860/"
-HEALTH_URL = f"{APP_URL}gradio_api/info"
+HEALTH_URL = APP_URL
 LOG_DIR = APP_DIR / "outputs" / "webui" / "logs"
 LOG_FILE = LOG_DIR / "server.log"
 PID_FILE = LOG_DIR / "server.pid"

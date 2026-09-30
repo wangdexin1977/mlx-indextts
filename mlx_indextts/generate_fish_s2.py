@@ -54,6 +54,7 @@ class FishS2ProTTS:
         self.sample_rate = int(self.runtime.sample_rate)
         self.tokenizer = _TokenizerAdapter(self)
         self.cache: dict[str, tuple[object, str]] = {}
+        self._encoded_reference = None
         self.last_reference_transcript = ""
         self.last_quality_fallback_used = False
         self.last_speed_optimization_used = False
@@ -154,6 +155,34 @@ class FishS2ProTTS:
             joined.append(segment)
         return np.concatenate(joined)
 
+    def _generate_results(self, **kwargs):
+        """Reuse one deterministic codec prompt, without changing sampling or KV state.
+
+        The installed mlx-audio runtime prepares the reference inside generate().
+        Scope the override to this call and restore it even on cancellation/error.
+        The WebUI serializes model jobs; this adapter is not thread-safe.
+        """
+        import mlx.core as mx
+
+        original = getattr(self.runtime, "_prepare_reference_prompt", None)
+        if original is None or kwargs.get("ref_audio") is None:
+            return list(self.runtime.generate(**kwargs))
+
+        def prepare(audio, text):
+            cached = getattr(self, "_encoded_reference", None)
+            if cached is not None and cached[0] is audio and cached[1] == text:
+                return cached[2]
+            prepared = original(audio, text)
+            mx.eval(*prepared[1])
+            self._encoded_reference = (audio, text, prepared)
+            return prepared
+
+        self.runtime._prepare_reference_prompt = prepare
+        try:
+            return list(self.runtime.generate(**kwargs))
+        finally:
+            self.runtime._prepare_reference_prompt = original
+
     def generate(
         self,
         *,
@@ -224,21 +253,19 @@ class FishS2ProTTS:
                             f"Fish S2 Pro 片段 {piece_index}/{len(planned_pieces)} 正在生成",
                         )
                     mx.random.seed(int(seed) + piece_index - 1)
-                    results = list(
-                        self.runtime.generate(
-                            text=piece,
-                            ref_audio=ref_audio,
-                            ref_text=aligned_ref_text or None,
-                            instruct=str(instruct or "").strip() or None,
-                            temperature=float(temperature),
-                            top_p=float(top_p),
-                            top_k=int(top_k),
-                            max_tokens=token_limit,
-                            speed=float(speed),
-                            chunk_length=int(chunk_length),
-                            stream=False,
-                            verbose=False,
-                        )
+                    results = self._generate_results(
+                        text=piece,
+                        ref_audio=ref_audio,
+                        ref_text=aligned_ref_text or None,
+                        instruct=str(instruct or "").strip() or None,
+                        temperature=float(temperature),
+                        top_p=float(top_p),
+                        top_k=int(top_k),
+                        max_tokens=token_limit,
+                        speed=float(speed),
+                        chunk_length=int(chunk_length),
+                        stream=False,
+                        verbose=False,
                     )
                     if not results:
                         raise RuntimeError("Fish S2 Pro 未返回音频。")

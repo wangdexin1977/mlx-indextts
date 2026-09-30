@@ -2,23 +2,54 @@
 
 IndexTTS for Apple Silicon using MLX. Zero-shot text-to-speech with voice cloning capabilities.
 
-Current WebUI release: **v0.3.4**. See [CHANGELOG.md](CHANGELOG.md) for the
+Current WebUI release: **v0.5.4**. See [CHANGELOG.md](CHANGELOG.md) for the
 version history; every release must update both that file and the in-app
 "About / Version" panel.
 
 ## WebUI model switching
 
-The WebUI can switch between IndexTTS 2.5, IndexTTS 2.0, OmniVoice and Fish
-Audio S2 Pro. OmniVoice supports voice cloning, text-described voice design
+The WebUI can switch between IndexTTS 2.5, IndexTTS 2.0, OmniVoice, Fish
+Audio S2 Pro, CosyVoice 3 and VoiceStudio OmniVoice. OmniVoice supports voice cloning, text-described voice design
 and automatic voices. Fish S2 Pro supports cloning, automatic/multi-speaker
 generation, inline expression tags and dedicated sampling controls. Models are
 loaded only when selected.
+
+IndexTTS 2.0 requires all three converted weights (`gpt.safetensors`,
+`s2mel.safetensors`, and `bigvgan.safetensors`) in `models/mlx-IndexTTS-2`.
+The WebUI now stops with a clear error if any is missing. Its default flow
+setting is 16 steps, measured locally on a 667-character Chinese passage with
+the natural/calm emotion setting; the other models keep their own profiles.
 
 Fish S2 Pro uses the 8-bit MLX conversion and is governed by the Fish Audio
 Research License: research and non-commercial use are free; commercial use
 requires a separate Fish Audio license.
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution and the
 upstream license link.
+
+CosyVoice 3 uses the official `Fun-CosyVoice3-0.5B-2512` weights in
+`models/Fun-CosyVoice3-0.5B-2512` and the Apple Silicon runtime in
+`vendor/cosyvoice3-macos/.venv`. Clone the runtime separately at the pinned
+commit and apply the two small local compatibility changes:
+
+```bash
+git clone https://github.com/drmhse/tts-funaudio-cozyvoice3.git vendor/cosyvoice3-macos
+git -C vendor/cosyvoice3-macos checkout a63acae32fc2154a5bfab4fb783f2b033e65d9e1
+git -C vendor/cosyvoice3-macos apply --unidiff-zero ../../patches/cosyvoice3-macos-local.patch
+```
+
+Install its isolated Python environment using
+[`requirements-cosyvoice3-macos.txt`](requirements-cosyvoice3-macos.txt); model
+weights and runtime environment are not stored in this repository. It outputs
+24 kHz audio. Select an existing
+voice, then choose **CosyVoice 3** in the same model dropdown. Its reference
+transcript is attached to each saved voice; when left blank, the exact 3–10
+second reference excerpt is transcribed locally with Qwen3-ASR. The dedicated
+controls default to FP16 LLM precision and 10 flow steps. On the local Apple
+Silicon test, FP16 preserved the reference speaker similarity and Chinese
+transcript while cutting model load and inference time; the flow and vocoder
+still run at FP32. FP32 remains available for comparison. Changing precision or flow steps
+reloads this backend on the next request. The worker stays loaded across voice
+changes, and the final status reports its synthesis RTF.
 
 ```bash
 uv add mlx-audio==0.4.6
@@ -31,12 +62,20 @@ uv run hf download mlx-community/Qwen3-ASR-0.6B-8bit \
 ```
 
 For stable cloning, OmniVoice must align the reference audio with its exact
-transcript. When the transcript field is empty, the WebUI preprocesses the
-reference prompt, transcribes that exact audio locally with Qwen3-ASR, and
-caches the result with the selected voice.
+transcript. Release v0.5.2 enforces the upstream recommended 3–10 second
+reference window. Longer library audio is cut near a low-energy boundary and
+that exact excerpt is transcribed locally with Qwen3-ASR before it is encoded.
+The output keeps OmniVoice's native 24 kHz resolution and only receives
+transparent edge/DC cleanup; it is not artificially upsampled.
 
 OmniVoice model weights are licensed CC-BY-NC (non-commercial use). This is
 the k2-fsa OmniVoice project, not Xiaomi's official MiMo TTS.
+
+OmniVoice exposes follow-reference, calm, happy, sad, energetic, serious,
+whisper, and custom expression choices in the WebUI and local synthesis skill.
+The base model has no IndexTTS-style emotion vector: whisper is native, while
+the named emotional choices are approximation presets using supported pitch,
+speed, and sampling controls.
 
 ## Features
 
@@ -231,3 +270,35 @@ MIT License
 
 - [IndexTTS](https://github.com/index-tts/index-tts) - Original PyTorch implementation
 - [MLX](https://github.com/ml-explore/mlx) - Apple's ML framework
+
+### VoiceStudio native engine
+
+The model selector also supports **VoiceStudio · OmniVoice 原生**, using the
+OmniVoice model code from VoiceStudio v0.5.2 in a separate local Python process.
+This is the native PyTorch/MPS engine, distinct from the existing OmniVoice MLX
+entry. The full VoiceStudio desktop frontend and its other engines are not
+started by this integration.
+
+Keep the VoiceStudio checkout beside this repository (`../VoiceStudio`, tag
+`v0.5.2`) and download `k2-fsa/OmniVoice` to `models/VoiceStudio-OmniVoice`, including
+`audio_tokenizer/`. The runtime uses the existing PyTorch/torchaudio stack,
+Transformers 5.5+ and `accelerate`. All inference runs offline. Apple Silicon
+uses MPS for the speech model and CPU for its upstream audio tokenizer.
+
+Recommended native defaults: cloning, Chinese, 32 steps, guidance 2.0, class
+temperature 0, position temperature 5, layer penalty 5, T-shift 0.1, speed 1,
+seed 42, reference duration 10 seconds. Supply a transcript matching that exact
+reference duration, or leave it blank for local ASR. Auto and design modes are
+also supported. Reference preprocessing and output processing use upstream
+OmniVoice defaults; this does not apply VoiceStudio's separate application
+mastering chain.
+
+Each model now retains a separate parameter profile in `user_settings.json`.
+Switching restores that model's values; “恢复推荐设置” resets only that model.
+IndexTTS-only controls are hidden for the other engines. Existing saved values
+are migrated on first selection. Switching away from the native engine releases
+its worker, and cancellation can stop it during a segment. Completed segments
+are preserved when generation is cancelled.
+
+Run `.venv/bin/python scripts/validate_voicestudio.py` for a local voice-clone
+smoke test using the existing test voice. Restart the WebUI to load code changes.

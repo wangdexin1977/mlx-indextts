@@ -1,0 +1,21 @@
+diff --git a/cosyvoice/cli/cosyvoice.py b/cosyvoice/cli/cosyvoice.py
+index 7ab04a7..c8094eb 100644
+--- a/cosyvoice/cli/cosyvoice.py
++++ b/cosyvoice/cli/cosyvoice.py
+@@ -19 +18,0 @@ from hyperpyyaml import load_hyperpyyaml
+-from modelscope import snapshot_download
+@@ -32,0 +32 @@ class CosyVoice:
++            from modelscope import snapshot_download
+@@ -144,0 +145 @@ class CosyVoice2(CosyVoice):
++            from modelscope import snapshot_download
+@@ -194,0 +196 @@ class CosyVoice3(CosyVoice2):
++            from modelscope import snapshot_download
+@@ -229,0 +232 @@ def AutoModel(**kwargs):
++        from modelscope import snapshot_download
+diff --git a/cosyvoice/cli/frontend.py b/cosyvoice/cli/frontend.py
+index 6d397cc..59d5adf 100644
+--- a/cosyvoice/cli/frontend.py
++++ b/cosyvoice/cli/frontend.py
+@@ -66,0 +67,2 @@ class CosyVoiceFrontEnd:
++                if os.environ.get('COSYVOICE_LOCAL_ONLY') == '1':
++                    raise RuntimeError('skip optional network text frontend')
