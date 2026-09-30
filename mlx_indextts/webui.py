@@ -54,7 +54,7 @@ from mlx_indextts.narration_text import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.5.4"
+APP_VERSION = "0.5.5"
 MODEL_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2.5-int8"
 MODEL_V2_DIR = PROJECT_ROOT / "models" / "mlx-IndexTTS-2"
 OMNIVOICE_MODEL_DIR = PROJECT_ROOT / "models" / "OmniVoice-bfloat16"
@@ -3045,6 +3045,63 @@ def _document_chapter_choices(document: ImportedDocument) -> list[tuple[str, str
     ]
 
 
+def _available_queue_chapter_choices(
+    document: ImportedDocument, source_id: str, queue_data: list[dict] | None,
+) -> list[tuple[str, str]]:
+    queued = {
+        chapter_id
+        for item in _normalise_document_queue(queue_data)
+        if item.get("source_id") == source_id
+        for chapter_id in item.get("selected_chapters") or []
+    }
+    return [choice for choice in _document_chapter_choices(document) if choice[1] not in queued]
+
+
+def _selected_queue_chapters(
+    document: ImportedDocument, chapter_ids: list[str] | str | None,
+) -> list[tuple[str, str, str]]:
+    requested = [chapter_ids] if isinstance(chapter_ids, str) else list(chapter_ids or [])
+    if not requested:
+        raise gr.Error("请先选择电子书需要转换的章节。")
+    if len(requested) != len(set(requested)):
+        raise gr.Error("请勿重复选择同一章节。")
+    choices = {value: index for index, (_label, value) in enumerate(_document_chapter_choices(document))}
+    if any(chapter_id not in choices for chapter_id in requested):
+        raise gr.Error("章节选择无效，请重新选择。")
+    return [
+        (chapter_id, document.chapters[index].title, select_document_text(document, [chapter_id]))
+        for chapter_id, index in sorted(((chapter_id, choices[chapter_id]) for chapter_id in requested), key=lambda pair: pair[1])
+    ]
+
+
+def _batch_chapter_marker(chapter_id: str) -> str:
+    return f"【章节边界｜{chapter_id}】"
+
+
+def _split_batch_chapter_edits(
+    edited_text: str, chapters: list[tuple[str, str, str]],
+) -> list[str]:
+    remaining = edited_text.strip()
+    texts = []
+    for index, (chapter_id, _title, _original) in enumerate(chapters):
+        marker = _batch_chapter_marker(chapter_id)
+        if not remaining.startswith(marker):
+            raise gr.Error("章节边界已改变，请重新选择章节后再确认。")
+        remaining = remaining[len(marker):].lstrip("\n")
+        next_marker = _batch_chapter_marker(chapters[index + 1][0]) if index + 1 < len(chapters) else None
+        if next_marker:
+            boundary = remaining.find("\n" + next_marker)
+            if boundary < 0:
+                raise gr.Error("章节边界已改变，请重新选择章节后再确认。")
+            chapter_text, remaining = remaining[:boundary], remaining[boundary + 1:]
+        else:
+            chapter_text = remaining
+        if any(_batch_chapter_marker(other_id) in chapter_text for other_id, _, _ in chapters):
+            raise gr.Error("章节边界重复，请重新选择章节后再确认。")
+        texts.append(_validate_synthesis_text(chapter_text))
+    return texts
+
+
 def _queue_book_choices(book_sources: list[dict] | None) -> list[tuple[str, str]]:
     return [
         (
@@ -3184,10 +3241,10 @@ def preview_queue_document(
     queue = _normalise_document_queue(queue_data)
     item = next((entry for entry in queue if entry["id"] == selected_id), None)
     if item is None:
-        return "", "请从队列中选择一份文档。", gr.Dropdown(visible=False), gr.Dropdown(value=None)
+        return "", "请从队列中选择一份文档。", gr.Dropdown(value=[], multiselect=True, visible=False), gr.Dropdown(value=None)
     count = count_effective_characters(str(item["text"]))
     status = QUEUE_STATUS_LABELS.get(str(item.get("status")), "待确认")
-    return str(item["text"]), f"正在预览：{item['title']}｜{count:,} 字｜{status}", gr.Dropdown(visible=False), gr.Dropdown(value=None)
+    return str(item["text"]), f"正在预览：{item['title']}｜{count:,} 字｜{status}", gr.Dropdown(value=[], multiselect=True, visible=False), gr.Dropdown(value=None)
 
 
 def preview_queue_book(
@@ -3198,32 +3255,38 @@ def preview_queue_book(
     source = next((book for book in book_sources or [] if book["id"] == source_id), None)
     queue_selector = gr.Dropdown(choices=_document_queue_choices(queue_data), value=None)
     if source is None:
-        return queue_selector, "", "请选择一本已解析的电子书。", gr.Dropdown(visible=False)
+        return queue_selector, "", "请选择一本已解析的电子书。", gr.Dropdown(value=[], multiselect=True, visible=False)
     document = ImportedDocument.from_dict(source["document"])
+    choices = _available_queue_chapter_choices(document, source_id, queue_data)
     return (
         queue_selector,
         "",
-        f"《{source['title']}》已解析；选一章预览并确认，之后可继续选下一章。",
-        gr.Dropdown(choices=_document_chapter_choices(document), value=None, visible=True),
+        f"《{source['title']}》已解析；可勾选一章或多章，确认后继续选择剩余章节。",
+        gr.Dropdown(choices=choices, value=[], multiselect=True, visible=True),
     )
 
 
 def preview_queue_book_chapter(
     book_sources: list[dict] | None,
     source_id: str | None,
-    chapter_id: str | None,
+    chapter_ids: list[str] | str | None,
 ) -> tuple[str, str]:
     source = next((book for book in book_sources or [] if book["id"] == source_id), None)
-    if source is None or not chapter_id:
+    if source is None or not chapter_ids:
         return "", "请选择需要加入队列的章节。"
-    try:
-        selected_text = select_document_text(source["document"], [chapter_id])
-    except DocumentImportError as exc:
-        raise gr.Error(str(exc)) from exc
-    count = count_effective_characters(selected_text)
-    message = f"已选择 {chapter_id}｜{count:,} 字；请检查文案并确认。"
-    if count > MAX_SYNTHESIS_CHARACTERS:
-        message += " 当前超过单次合成上限，请减少章节。"
+    chapters = _selected_queue_chapters(ImportedDocument.from_dict(source["document"]), chapter_ids)
+    if len(chapters) == 1:
+        chapter_id, _title, selected_text = chapters[0]
+        message = f"已选择 {chapter_id}｜{count_effective_characters(selected_text):,} 字；请检查文案并确认。"
+    else:
+        selected_text = "\n\n".join(
+            f"{_batch_chapter_marker(chapter_id)}\n{chapter_text}"
+            for chapter_id, _title, chapter_text in chapters
+        )
+        message = f"已选择 {len(chapters)} 章；确认后每章单独加入队列、分别生成音频。可编辑各章正文，请保留章节边界。"
+    oversized = [title for _id, title, text in chapters if count_effective_characters(text) > MAX_SYNTHESIS_CHARACTERS]
+    if oversized:
+        message += f" 以下章节超过单章上限：{'、'.join(oversized)}。"
     return selected_text, message
 
 
@@ -3246,42 +3309,41 @@ def confirm_queue_document(
     edited_text: str,
     book_sources: list[dict] | None = None,
     source_id: str | None = None,
-    chapter_id: str | None = None,
+    chapter_ids: list[str] | str | None = None,
 ) -> tuple[list[dict], gr.Dropdown, str, str, gr.Dropdown, str | dict]:
     queue = _normalise_document_queue(queue_data)
     source = next((book for book in book_sources or [] if book["id"] == source_id), None)
     if source is not None:
-        if not chapter_id:
-            raise gr.Error("请先选择电子书需要转换的章节。")
         document = ImportedDocument.from_dict(source["document"])
-        chapter = next(
-            (chapter for index, chapter in enumerate(document.chapters)
-             if f"{index + 1}. {chapter.title}" == chapter_id),
-            None,
+        chapters = _selected_queue_chapters(document, chapter_ids)
+        available = {value for _label, value in _available_queue_chapter_choices(document, source_id, queue)}
+        if any(chapter_id not in available for chapter_id, _title, _text in chapters):
+            raise gr.Error("所选章节已在队列中，请选择尚未加入的章节。")
+        texts = (
+            [_validate_synthesis_text(edited_text)]
+            if len(chapters) == 1 else _split_batch_chapter_edits(edited_text, chapters)
         )
-        if chapter is None:
-            raise gr.Error("章节选择无效，请重新选择。")
-        cleaned = _validate_synthesis_text(edited_text)
-        chapter_title = chapter.title
-        queue.append({
-            "id": uuid.uuid4().hex,
-            "filename": source["filename"],
-            "file_type": document.file_type,
-            "source_id": source_id,
-            "title": f"{source['title']} · {chapter_title}",
-            "text": cleaned,
-            "selected_chapters": [chapter_id],
-            "status": "confirmed",
-            "confirmed": True,
-            "output": "",
-            "error": "",
-        })
+        for (chapter_id, chapter_title, _original), cleaned in zip(chapters, texts):
+            queue.append({
+                "id": uuid.uuid4().hex,
+                "filename": source["filename"],
+                "file_type": document.file_type,
+                "source_id": source_id,
+                "title": f"{source['title']} · {chapter_title}",
+                "text": cleaned,
+                "selected_chapters": [chapter_id],
+                "status": "confirmed",
+                "confirmed": True,
+                "output": "",
+                "error": "",
+            })
+        remaining_choices = _available_queue_chapter_choices(document, source_id, queue)
         return (
             queue,
             gr.Dropdown(choices=_document_queue_choices(queue), value=None),
             render_document_queue(queue),
-            f"已确认并加入队列：{chapter_title}｜可继续选择下一章。",
-            gr.Dropdown(value=None),
+            f"已确认并加入 {len(chapters)} 章，每章单独生成音频。" + (" 可继续选择剩余章节。" if remaining_choices else " 本书章节已全部加入队列。"),
+            gr.Dropdown(choices=remaining_choices, value=[], multiselect=True),
             "",
         )
     item = next((entry for entry in queue if entry["id"] == selected_id), None)
@@ -5038,19 +5100,19 @@ def build_ui() -> gr.Blocks:
                 <span class="app-badge">Apple MLX</span>
                 <span class="app-badge">离线可用</span>
                 <span class="app-badge">OmniVoice 24 kHz</span>
-                <button id="about-open" class="about-trigger" type="button">关于 / v0.5.4</button>
+                <button id="about-open" class="about-trigger" type="button">关于 / v0.5.5</button>
               </div>
             </header>
 
             <div id="about-modal" class="about-modal" aria-hidden="true">
               <section class="about-card" role="dialog" aria-modal="true" aria-labelledby="about-title">
                 <div class="about-card-head">
-                  <h2 id="about-title">IndexTTS WebUI · v0.5.4</h2>
+                  <h2 id="about-title">IndexTTS WebUI · v0.5.5</h2>
                   <button id="about-close" class="about-close" type="button" aria-label="关闭">×</button>
                 </div>
                 <div class="about-card-body">
                   <div class="about-current">
-                    <strong>当前应用版本：v0.5.4（2026-09-30，夜间队列支持多音色）</strong><br>
+                    <strong>当前应用版本：v0.5.5（2026-09-30，夜间电子书支持多章批量确认）</strong><br>
                     默认使用 OmniVoice、默认输出 MP3；六个引擎按需分时加载，避免同时占用统一内存。
                   </div>
                   <table class="about-table">
@@ -5068,10 +5130,18 @@ def build_ui() -> gr.Blocks:
                       <tr><td>MLX 推理引擎</td><td>0.31.1</td><td>运行于 Apple Silicon 统一内存和 GPU。</td></tr>
                       <tr><td>PyTorch</td><td>2.10.0（VoiceStudio / 旧 2.0 回退）</td><td>VoiceStudio 使用独立 PyTorch/MPS 子进程；IndexTTS 2.5 主路径为 Torch-free MLX。</td></tr>
                       <tr><td>文档导入 / OCR</td><td>Calibre 9.13.0 / Tesseract 5</td><td>本机读取 TXT、MD、DOC、DOCX、PDF、EPUB、MOBI；扫描 PDF 使用本机中文 OCR。</td></tr>
-                      <tr><td>WebUI</td><td><strong>mlx-indextts 0.5.4</strong> + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持文本清洗、多人轮换朗读、六个引擎入口、逐章导入、队列、长文分段、暂停、终止、实时试听与音质检查。</td></tr>
+                      <tr><td>WebUI</td><td><strong>mlx-indextts 0.5.5</strong> + IndexTTS-2.5 MLX 0.1.1</td><td>本地网页界面；支持文本清洗、多人轮换朗读、六个引擎入口、电子书多章选择、队列、长文分段、暂停、终止、实时试听与音质检查。</td></tr>
                     </tbody>
                   </table>
                   <div class="about-changelog-title">版本变更日志</div>
+                  <section class="about-release">
+                    <div class="about-release-head"><strong>v0.5.5</strong><span>2026-09-30 · 夜间电子书多章批量确认</span></div>
+                    <ul>
+                      <li>EPUB/MOBI 可一次勾选一章或多章；每章独立加入队列，分别生成音频。</li>
+                      <li>多章预览可分别修改正文，确认时按章节边界拆分，避免内容串章。</li>
+                      <li>确认后保留已解析的书，只显示未加入队列的章节，方便继续选章确认。</li>
+                    </ul>
+                  </section>
                   <section class="about-release">
                     <div class="about-release-head"><strong>v0.5.4</strong><span>2026-09-30 · 夜间队列多音色与文档输出优化</span></div>
                     <ul>
@@ -5208,8 +5278,8 @@ def build_ui() -> gr.Blocks:
                         """
                         <div class="queue-guide">
                           <strong>使用顺序：</strong>
-                          ① 导入并解析电子书一次；② 每次选一章，预览后点击“确认当前章节”，可继续选下一章；
-                          ③ 每章作为独立任务加入队列；④ 启动队列后逐章生成音频。
+                          ① 导入并解析电子书一次；② 勾选一章或多章，预览后确认；
+                          ③ 可继续勾选剩余章节并确认；④ 每章作为独立任务，启动后逐章生成音频。
                         </div>
                         """
                     )
@@ -5235,15 +5305,16 @@ def build_ui() -> gr.Blocks:
                         variant="secondary",
                     )
                     queue_book_selector = gr.Dropdown(
-                        label="已解析电子书（选一章，确认后可继续选下一章）",
+                        label="已解析电子书（确认后可继续选章）",
                         choices=[],
                         value=None,
                         visible=False,
                     )
                     queue_chapter_selector = gr.Dropdown(
-                        label="选择本次要生成的章节",
+                        label="选择本次要生成的章节（可多选）",
                         choices=[],
-                        value=None,
+                        value=[],
+                        multiselect=True,
                         filterable=True,
                         visible=False,
                     )
@@ -5260,7 +5331,7 @@ def build_ui() -> gr.Blocks:
                         queue_remove_button = gr.Button("移除")
                     with gr.Row(elem_classes=["queue-actions"]):
                         queue_confirm_button = gr.Button(
-                            "确认当前章节 / 文档",
+                            "确认所选章节 / 文档",
                             scale=1,
                             elem_classes=["queue-confirm-action"],
                         )

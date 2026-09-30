@@ -185,10 +185,10 @@ def test_ebook_import_only_selected_chapter(tmp_path: Path, monkeypatch, extensi
         assert len(queue) == number
         assert all(item["confirmed"] for item in queue)
         assert queue_selector.value is None
-        assert cleared_chapter.value is None
+        assert cleared_chapter.value == []
         assert cleared_text == ""
         assert f"已确认 {number}/{number}" in queue_summary
-        assert "可继续选择下一章" in confirm_status
+        assert "可继续选择剩余章节" in confirm_status or "已全部加入队列" in confirm_status
     assert len(sources) == 1
     assert import_calls == [str(source)]
     assert len({item["id"] for item in queue}) == 3
@@ -196,6 +196,69 @@ def test_ebook_import_only_selected_chapter(tmp_path: Path, monkeypatch, extensi
         [f"{n}. {title}"]
         for n, title in enumerate(("第一章", "第二章", "第三章"), start=1)
     ]
+
+
+@pytest.mark.parametrize("file_type", ["EPUB", "MOBI"])
+def test_ebook_can_confirm_multiple_chapters_then_select_more(file_type: str):
+    sources = [{
+        "id": "ebook",
+        "filename": f"chapters.{file_type.lower()}",
+        "title": "章节书",
+        "document": {
+            "filename": f"chapters.{file_type.lower()}",
+            "file_type": file_type,
+            "title": "章节书",
+            "chapters": [
+                {"title": title, "text": f"{title}正文。", "source_index": index}
+                for index, title in enumerate(("第一章", "第二章", "第三章"))
+            ],
+        },
+    }]
+    _, _, _, selector = preview_queue_book(sources, "ebook", [])
+    assert len(selector.choices) == 3
+    first_batch = [selector.choices[1][1], selector.choices[0][1]]
+    preview, status = preview_queue_book_chapter(sources, "ebook", first_batch)
+    assert "已选择 2 章" in status
+    assert preview.index("第一章正文") < preview.index("第二章正文")
+    with pytest.raises(Exception, match="章节边界已改变"):
+        confirm_queue_document(
+            [], None, preview.replace("【章节边界｜1. 第一章】", ""),
+            sources, "ebook", first_batch,
+        )
+    preview = preview.replace("第二章正文。", "第二章已校订正文。")
+    queue, _, summary, message, next_selector, cleared_text = confirm_queue_document(
+        [], None, preview, sources, "ebook", first_batch
+    )
+    assert len(queue) == 2
+    assert [item["selected_chapters"] for item in queue] == [["1. 第一章"], ["2. 第二章"]]
+    assert [item["text"] for item in queue] == ["第一章正文。", "第二章已校订正文。"]
+    assert all(item["confirmed"] for item in queue)
+    assert next_selector.value == []
+    assert [value for _label, value in next_selector.choices] == ["3. 第三章"]
+    assert cleared_text == ""
+    assert "已确认 2/2" in summary
+    assert "每章单独生成音频" in message
+
+    third_id = next_selector.choices[0][1]
+    third_text, _ = preview_queue_book_chapter(sources, "ebook", [third_id])
+    queue, _, _, message, next_selector, _ = confirm_queue_document(
+        queue, None, third_text, sources, "ebook", [third_id]
+    )
+    assert len(queue) == 3
+    assert queue[-1]["selected_chapters"] == ["3. 第三章"]
+    assert next_selector.choices == []
+    assert "已全部加入队列" in message
+    with pytest.raises(Exception, match="已在队列"):
+        confirm_queue_document(queue, None, third_text, sources, "ebook", [third_id])
+
+
+def test_queue_chapter_selector_allows_multiple_chapters():
+    demo = webui.build_ui()
+    selector = next(
+        component for component in demo.config["components"]
+        if component.get("props", {}).get("label") == "选择本次要生成的章节（可多选）"
+    )
+    assert selector["props"]["multiselect"] is True
 
 
 def test_multiple_documents_can_be_queued_previewed_confirmed_and_reordered(tmp_path: Path):
@@ -262,12 +325,16 @@ def test_confirmed_document_queue_runs_sequentially_and_writes_manifest(
         },
     }]
     ebook_queue = []
-    for number, title in enumerate(("第一章", "第二章", "第三章"), start=1):
-        chapter_id = f"{number}. {title}"
-        selected_text, _ = preview_queue_book_chapter(sources, "ebook", chapter_id)
-        ebook_queue, _, _, _, _, _ = confirm_queue_document(
-            ebook_queue, None, selected_text, sources, "ebook", chapter_id
-        )
+    first_batch = ["1. 第一章", "2. 第二章"]
+    selected_text, _ = preview_queue_book_chapter(sources, "ebook", first_batch)
+    ebook_queue, _, _, _, _, _ = confirm_queue_document(
+        ebook_queue, None, selected_text, sources, "ebook", first_batch
+    )
+    last_chapter = ["3. 第三章"]
+    selected_text, _ = preview_queue_book_chapter(sources, "ebook", last_chapter)
+    ebook_queue, _, _, _, _, _ = confirm_queue_document(
+        ebook_queue, None, selected_text, sources, "ebook", last_chapter
+    )
     queue = ebook_queue + [
         {
             "id": "first",

@@ -838,9 +838,9 @@ def test_about_panel_and_changelog_track_current_release():
     source = inspect.getsource(webui.build_ui)
     changelog = (webui.PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert webui.APP_VERSION == "0.5.4"
-    assert "关于 / v0.5.4" in source
-    assert "v0.5.4" in changelog
+    assert webui.APP_VERSION == "0.5.5"
+    assert "关于 / v0.5.5" in source
+    assert "v0.5.5" in changelog
     assert "夜间多文档队列沿用多音色轮换设置" in source
     assert "硬链接共享" in source
     assert "VoiceStudio v0.5.2" in source

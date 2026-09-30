@@ -1,6 +1,6 @@
 [project]
 name = "mlx-indextts"
-version = "0.5.4"
+version = "0.5.5"
 description = "IndexTTS for Apple Silicon using MLX"
 readme = "README.md"
 license = { text = "MIT" }
